@@ -129,7 +129,7 @@
     unused_qualifications,
 )]
 
-use core::cell::{Cell, UnsafeCell};
+use core::cell::{Cell, RefCell};
 
 use core::future::Future;
 use core::pin::Pin;
@@ -148,11 +148,7 @@ pub struct Node<T> {
     /// `None`.
     links: Cell<Option<(LinkPtr<T>, LinkPtr<T>)>>,
     /// Waker to poke when this node is kicked out of a list.
-    ///
-    /// This is in an `UnsafeCell` because we need to do sneaky things with it
-    /// through a shared reference. It could probably be `RefCell` at some
-    /// runtime cost.
-    waker: UnsafeCell<Waker>,
+    waker: RefCell<Waker>,
     /// Value used to order this node in a list.
     contents: T,
 
@@ -172,13 +168,15 @@ impl<T> Node<T> {
     pub fn new(contents: T, waker: Waker) -> Self {
         Self {
             links: Cell::default(),
-            waker: UnsafeCell::new(waker),
+            waker: RefCell::new(waker),
             contents,
             _marker: NotSendMarker::default(),
         }
     }
 
     /// Disconnects a node from any list. This is idempotent.
+    ///
+    /// This does _not_ poke the waker.
     pub fn detach(self: Pin<&Self>) {
         // TODO: it's not clear that this operation needs to require Pin. It's
         // safe if called on a non-pinned node, since by definition if a node is
@@ -190,6 +188,16 @@ impl<T> Node<T> {
                 next.change_prev(prev);
             }
         }
+    }
+
+    /// Pokes the node's waker.
+    ///
+    /// In applications where unwinding is on, any panics in the waker will be
+    /// discarded. (In applications that abort on panic, panics will abort as
+    /// usual.)
+    fn wake(&self) {
+        let waker = &*self.waker.borrow();
+        tolerate_panic(|| waker.wake_by_ref());
     }
 
     /// Checks if a node is detached.
@@ -473,11 +481,7 @@ impl<T: PartialOrd> List<T> {
             // away.
             let next = cref.links.get().expect("node in list without links").1;
             cref.detach();
-
-            // TODO: I need a better safety proof for this UnsafeCell.
-            unsafe {
-                (&*cref.waker.get()).wake_by_ref();
-            }
+            cref.wake();
 
             candidate = next.as_node();
         }
@@ -497,10 +501,7 @@ impl<T> List<T> {
             // away.
             let next = cref.links.get().expect("node in list without links").1;
             cref.detach();
-
-            // TODO: I need a better safety proof for this UnsafeCell.
-            let waker = unsafe { &*cref.waker.get() };
-            tolerate_panic(|| waker.wake_by_ref());
+            cref.wake();
 
             candidate = next.as_node();
         }
@@ -518,8 +519,7 @@ impl List<()> {
             // Safety: Link Valid Invariant
             let cref = unsafe { Pin::new_unchecked(candidate.as_ref()) };
             cref.detach();
-            let w = unsafe { &*cref.waker.get() };
-            w.wake_by_ref();
+            cref.wake();
             true
         } else {
             false
@@ -590,8 +590,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, T, F> {
         } else {
             // The node remains attached to the list. The waker may have
             // changed. Update it.
-            let w = unsafe { &mut *self.node.waker.get() };
-            *w = cx.waker().clone();
+            *self.node.waker.borrow_mut() = cx.waker().clone();
             Poll::Pending
         }
     }
