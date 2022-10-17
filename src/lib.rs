@@ -183,6 +183,9 @@ impl<T> Node<T> {
         // not pinned it isn't in a list.
 
         if let Some((prev, next)) = self.links.take() {
+            // Safety: per the Link Valid Invariant we can dereference these
+            // pointers, which is the property change_{next,prev} need to be
+            // used safely.
             unsafe {
                 prev.change_next(next);
                 next.change_prev(prev);
@@ -423,12 +426,17 @@ impl<T: PartialOrd> List<T> {
             }
 
             if let Some(neighbor) = candidate {
-                // we must insert just before neighbor.
+                // We must insert just before neighbor.
+                // Safety: Link Valid Invariant means we can get a shared
+                // reference to neighbor's pointee.
                 let nref = unsafe { neighbor.as_ref() };
                 debug_assert!(nref.contents >= node.contents);
                 let (neigh_prev, neigh_next) = nref.links.get().unwrap();
                 node.links.set(Some((neigh_prev, LinkPtr::Inner(neighbor))));
                 nref.links.set(Some((LinkPtr::Inner(nnn), neigh_next)));
+                // Safety: Link Valid Invariant means we can get the shared
+                // reference to neigh_prev's pointee that we need to store this
+                // pointer.
                 unsafe {
                     neigh_prev.change_next(LinkPtr::Inner(nnn));
                 }
@@ -440,6 +448,9 @@ impl<T: PartialOrd> List<T> {
                         LinkPtr::End(NonNull::from(self.get_ref())),
                     )));
                     self.links.set(Some((nnn, head)));
+                    // Safety: Link Valid Invariant means we can get the shared
+                    // reference to old_tail's pointee that we need to store
+                    // this pointer.
                     unsafe {
                         LinkPtr::Inner(old_tail).change_next(LinkPtr::Inner(nnn));
                     }
@@ -530,7 +541,15 @@ impl List<()> {
 impl<T> Drop for List<T> {
     fn drop(&mut self) {
         if self.links.get().is_some() {
+            // Safety: If this list is not empty, it must have been pinned,
+            // since that's the only way you can insert things. Any other pinned
+            // references to it will have gone away (since we've gotten to
+            // drop). Thus we can pin our sole reference here and trivially meet
+            // Pin's guarantees by not moving `self` until we finish this
+            // function.
             let this = unsafe { Pin::new_unchecked(&*self) };
+
+            // Detach all nodes so they aren't left with dangling pointers.
             this.wake_all();
         }
     }
