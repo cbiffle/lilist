@@ -1,29 +1,29 @@
 
 //! Doubly-linked intrusive lists for scheduling and waking.
 //!
-//! A [`List<T>`][List] keeps track of nodes (of type [`Node<T>`][Node]) that
-//! each contain some value `T`. The list is kept in ascending sorted order by
-//! comparing the `T`s:
+//! A [`WaitList<T>`][WaitList] keeps track of nodes (of type [`Node<T>`][Node])
+//! that each contain some value `T`. The list is kept in ascending sorted order
+//! by comparing the `T`s:
 //!
-//! - [`List::insert_and_wait`] traverses the list to insert the `Node` in its
-//!   proper place, and then produces a future that waits for the node to be
+//! - [`WaitList::insert_and_wait`] traverses the list to insert the `Node` in
+//!   its proper place, and then produces a future that waits for the node to be
 //!   kicked back out.
-//! - [`List::wake_le`] starts at one end and removes every `Node` with a
+//! - [`WaitList::wake_le`] starts at one end and removes every `Node` with a
 //!   value less than a threshold.
 //!
 //! The sort order is intended for keeping track of timestamps/deadlines, but
 //! you may find others uses for it.
 //!
 //! If you just want to keep things in a list, and don't care about order or
-//! need to associate a timestamp, simply use `List<()>`. This disables the
+//! need to associate a timestamp, simply use `WaitList<()>`. This disables the
 //! sorting and removes the order-related fields from both the list and node.
 //!
 //! # How to use for sleep/wake
 //!
-//! The basics are straightforward: given a `List` tracking waiters on a
+//! The basics are straightforward: given a `WaitList` tracking waiters on a
 //! particular event, create a `Node` and `insert_and_wait` it. At some future
 //! point in a concurrent process or interrupt handler, one of the `wake_*`
-//! methods on `List` gets called, and the `Node` will be removed and its
+//! methods on `WaitList` gets called, and the `Node` will be removed and its
 //! associated `Waker` invoked, causing the future produced by `insert_and_wait`
 //! to resolve.
 //!
@@ -32,8 +32,8 @@
 //!
 //! # Pinning
 //!
-//! Because `List` and `Node` create circular, self-referential data structures,
-//! all operations require that they be
+//! Because `WaitList` and `Node` create circular, self-referential data
+//! structures, all operations require that they be
 //! [pinned](https://doc.rust-lang.org/core/pin/). Because we don't use the
 //! heap, we provide ways to create and use pinned data structures on the stack.
 //! This is a wee bit involved, but we provide convenience macros to help.
@@ -56,7 +56,7 @@
 //! ```
 //!
 //! Behind the scenes, creating a list or node is a two-step process. We'll
-//! use `Node` as a running example here, but the same applies to `List`.
+//! use `Node` as a running example here, but the same applies to `WaitList`.
 //!
 //! 1. Create the node using [`Node::new`]. This will get you a bare `Node`,
 //!    which is not very useful yet.
@@ -66,8 +66,8 @@
 //!    [`pin_mut!`](https://docs.rs/pin-utils/0.1/pin_utils/macro.pin_mut.html)
 //!    macro makes doing this on the stack easier.
 //!
-//! (In the `List` case you'll usually also want to drop exclusivity by calling
-//! `Pin::into_ref`.)
+//! (In the `WaitList` case you'll usually also want to drop exclusivity by
+//! calling `Pin::into_ref`.)
 //!
 //! So, with that in mind, the fully-manual version of the example above reads
 //! as follows:
@@ -99,7 +99,7 @@
 //! duration of its membership in the list. If the API were instead `insert`,
 //! we'd return to the caller, who is still holding a `&mut Node` -- a
 //! supposedly exclusive reference to a structure that is now also reachable
-//! through the `List`!
+//! through the `WaitList`!
 //!
 //! This is why there is no `insert` operation, or a `take` operation that
 //! returns a node -- both operations would compromise memory safety.
@@ -109,9 +109,9 @@
 // The safety comments in this module reference the following invariants:
 //
 // Link Valid Invariant: all the link pointers (that is, `Node::prev` and
-// `Node::next`) transitively reachable from either `List` or `Node` are valid /
-// not dangling. We maintain this by only setting them to the addresses of
-// pinned structures, and ensuring that the `Drop` impl of those pinned
+// `Node::next`) transitively reachable from either `WaitList` or `Node` are
+// valid / not dangling. We maintain this by only setting them to the addresses
+// of pinned structures, and ensuring that the `Drop` impl of those pinned
 // structures will remove their addresses from any link.
 
 #![warn(
@@ -140,7 +140,8 @@ use core::marker::{PhantomData, PhantomPinned};
 ///////////////////////////////////////////////////////////////////////////
 // Node implementation
 
-/// A node that can be inserted into a [`List`] and used to wait for an event.
+/// A node that can be inserted into a [`WaitList`] and used to wait for an
+/// event.
 pub struct Node<T> {
     /// Links to the previous and next things in a list, in that order.
     ///
@@ -251,17 +252,17 @@ macro_rules! create_node {
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// List implementation
+// WaitList implementation
 
-/// A list of `Node`s.
+/// A list of `Node`s waiting for something.
 ///
 /// The list *references*, but does not *own*, the nodes. The creator of each
 /// node keeps ownership of it. This is okay because, before the creator can
 /// drop the node, the node will remove itself from the list.
 ///
 /// Because lists contain self-referential pointers, creating one is somewhat
-/// involved. Use the [`create_list!`] macro when possible, or see `List::new`
-/// for instructions.
+/// involved. Use the [`create_list!`] macro when possible, or see
+/// `WaitList::new` for instructions.
 ///
 /// # Drop
 ///
@@ -271,13 +272,13 @@ macro_rules! create_node {
 ///
 /// This isn't the only way we could do things, but it is the safest. If you're
 /// curious about the details, see the source code for `Drop`.
-pub struct List<T> {
+pub struct WaitList<T> {
     links: Cell<Option<(NonNull<Node<T>>, NonNull<Node<T>>)>>,
     _marker: (NotSendMarker, PhantomPinned),
 }
 
-impl<T> List<T> {
-    /// Creates a `List` in an initialized, empty state.
+impl<T> WaitList<T> {
+    /// Creates a `WaitList` in an initialized, empty state.
     ///
     /// In this state, the list is not very useful. To access most of its API,
     /// you must pin it. The simplest way to do this properly is with the
@@ -286,9 +287,9 @@ impl<T> List<T> {
     /// like so:
     ///
     /// ```
-    /// # use lilist::List;
+    /// # use lilist::WaitList;
     /// // create the list on the stack
-    /// let list = List::<()>::new();
+    /// let list = WaitList::<()>::new();
     /// // pin it in-place
     /// pin_utils::pin_mut!(list);
     /// // drop exclusivity
@@ -302,7 +303,7 @@ impl<T> List<T> {
     /// # use lilist::create_list;
     /// create_list!(list, ());
     /// ```
-    pub fn new() -> List<T> {
+    pub fn new() -> WaitList<T> {
         Self {
             links: Cell::default(),
             _marker: (NotSendMarker::default(), PhantomPinned),
@@ -311,14 +312,14 @@ impl<T> List<T> {
 }
 
 /// Operations on lists of ordered nodes (which includes `()`).
-impl<T: PartialOrd> List<T> {
+impl<T: PartialOrd> WaitList<T> {
     /// Inserts `node` into this list, maintaining ascending sort order, and
     /// then waits for it to be kicked back out.
     ///
     /// Specifically, `node` will be placed just *before* the first item in the
     /// list whose `contents` are greater than or equal to `node.contents`, if
     /// such an item exists, or at the end if not. This means if you use it on a
-    /// `List<()>` (that is, a simple queue) it will insert the node at the
+    /// `WaitList<()>` (that is, a simple queue) it will insert the node at the
     /// front of the list.
     ///
     /// The returned future will resolve only when `node` has become detached
@@ -358,7 +359,7 @@ impl<T: PartialOrd> List<T> {
     /// Specifically, `node` will be placed just *before* the first item in the
     /// list whose `contents` are greater than or equal to `node.contents`, if
     /// such an item exists, or at the end if not. This means if you use it on a
-    /// `List<()>` (that is, a simple queue) it will insert the node at the
+    /// `WaitList<()>` (that is, a simple queue) it will insert the node at the
     /// front of the list.
     ///
     /// The returned future will resolve only when `node` has become detached
@@ -499,7 +500,7 @@ impl<T: PartialOrd> List<T> {
     }
 }
 
-impl<T> List<T> {
+impl<T> WaitList<T> {
     /// Convenience method for waking all the waiters, because not all ordered
     /// types have an easily available MAX element, and because (on
     /// insertion-ordered queues) `wake_le(())` looks weird.
@@ -520,7 +521,7 @@ impl<T> List<T> {
 }
 
 /// Operations specific to insertion-orded queues.
-impl List<()> {
+impl WaitList<()> {
     /// Wakes the oldest (earliest inserted) waiter on an unsorted list.
     ///
     /// Returns a flag indicating whether anything was done (i.e. whether the
@@ -538,7 +539,7 @@ impl List<()> {
     }
 }
 
-impl<T> Drop for List<T> {
+impl<T> Drop for WaitList<T> {
     fn drop(&mut self) {
         if self.links.get().is_some() {
             // Safety: If this list is not empty, it must have been pinned,
@@ -558,9 +559,9 @@ impl<T> Drop for List<T> {
 /// We need a custom `Debug` impl because the inferred one will require `T:
 /// Debug`; since we only print pointers to `T` we don't need to be so
 /// stringent.
-impl<T: core::fmt::Debug> core::fmt::Debug for List<T> {
+impl<T: core::fmt::Debug> core::fmt::Debug for WaitList<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("List")
+        f.debug_struct("WaitList")
             .field("links", &self.links)
             .finish()
     }
@@ -573,7 +574,7 @@ impl<T: core::fmt::Debug> core::fmt::Debug for List<T> {
 #[macro_export]
 macro_rules! create_list {
     ($var:ident, $t:ty) => {
-        let $var = $crate::List::<$t>::new();
+        let $var = $crate::WaitList::<$t>::new();
         pin_utils::pin_mut!($var);
         // Drop mutability, since we expect the list to be aliased shortly.
         let $var = $var.into_ref();
@@ -652,7 +653,7 @@ enum LinkPtr<T> {
     /// A pointer to a node within the list.
     Inner(NonNull<Node<T>>),
     /// A pointer to the list root.
-    End(NonNull<List<T>>),
+    End(NonNull<WaitList<T>>),
 }
 
 type NNN<T> = NonNull<Node<T>>;
@@ -677,10 +678,10 @@ impl<T> LinkPtr<T> {
     /// about safe dereferencing of a pointer apply.
     ///
     /// In addition, to be used safely, this must not subvert the Link Valid
-    /// Invariant on the overall List/Node type family, which means that `next`
-    /// must be a valid pointer and must point to either another node in the
-    /// same list as the one pointed to by `self`, or the list root reachable
-    /// from `self`.
+    /// Invariant on the overall WaitList/Node type family, which means that
+    /// `next` must be a valid pointer and must point to either another node in
+    /// the same list as the one pointed to by `self`, or the list root
+    /// reachable from `self`.
     unsafe fn change_next(&self, next: Self) {
         fn replace_next<T>((prev, _next): (T, T), new: T) -> (T, T) {
             (prev, new)
@@ -700,10 +701,10 @@ impl<T> LinkPtr<T> {
     /// about safe dereferencing of a pointer apply.
     ///
     /// In addition, to be used safely, this must not subvert the Link Valid
-    /// Invariant on the overall List/Node type family, which means that `prev`
-    /// must be a valid pointer and must point to either another node in the
-    /// same list as the one pointed to by `self`, or the list root reachable
-    /// from `self`.
+    /// Invariant on the overall WaitList/Node type family, which means that
+    /// `prev` must be a valid pointer and must point to either another node in
+    /// the same list as the one pointed to by `self`, or the list root
+    /// reachable from `self`.
     unsafe fn change_prev(&self, prev: Self) {
         fn replace_prev<T>((_prev, next): (T, T), new: T) -> (T, T) {
             (new, next)
@@ -827,7 +828,7 @@ mod tests {
 
     /// Performs a list structural integrity check, panics if any issues are
     /// found.
-    fn check<T: PartialOrd>(list: Pin<&List<T>>) {
+    fn check<T: PartialOrd>(list: Pin<&WaitList<T>>) {
         let (tail, head) = if let Some((t, h)) = list.links.get() {
             (t, h)
         } else {
@@ -866,7 +867,7 @@ mod tests {
     }
 
     #[allow(dead_code)] // useful when tests are failing
-    fn dump<T>(list: Pin<&List<T>>)
+    fn dump<T>(list: Pin<&WaitList<T>>)
         where T: core::fmt::Debug,
     {
         println!("--- list dump ---");
@@ -1223,7 +1224,7 @@ mod tests {
         pin_utils::pin_mut!(node1);
 
         let fut = {
-            let list = List::<()>::new();
+            let list = WaitList::<()>::new();
             pin_utils::pin_mut!(list);
 
             list.as_ref().insert_and_wait(node1)
