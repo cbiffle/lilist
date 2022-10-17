@@ -1,1 +1,133 @@
-Extracting the list structure from Lilos so it can be tested more easily
+# Intrusive stack-allocated doubly-linked list example
+
+## Background
+
+In kernel/RTOS environments in C, there's a common pattern for managing things
+like event and timer queues:
+
+- A central fixed-size list structure is created for the timer or event.
+- Each thread/process/whatever that wishes to join the list (wait for the event)
+  allocates a list node, often as part of a larger structure like a mutex, and
+  inserts it. The list node is often allocated on the stack.
+
+This ensures that the memory required to implement the list or queue is "caller
+paid" -- rather than needing to allocate a shared buffer large enough for all
+possible callers, we rely on the callers to "donate" memory when they need it.
+Because the list node forms a part of the thing being inserted into the list, we
+call this an "intrusive" list -- types have to have been designed to be list
+members.
+
+The list is often implemented as a doubly-linked list. This ensures two things:
+
+1. The owner of the list can pop nodes in either order in constant time, and
+   maintain them in a sorted order easily (albeit not in constant time).
+
+2. The owner of the _node_ can decide to give up -- say, because of a timeout --
+   and remove their node from the list in constant time.
+
+## In Rust
+
+Systems written in Rust tend to avoid using intrusive doubly-linked lists,
+despite their ubiquity in C, because a combination of factors make them hard to
+get right.
+
+Doubly-linked lists, and linked lists in general, rely heavily on _aliasing,_
+and part of Rust's value compared to C is that it makes it easier to reason
+about aliasing and the bugs it creates... as long as your aliasing patterns are
+relatively simple. Doubly-linked lists are _not_ a simple aliasing pattern to
+analyze, in any language.
+
+Writing any general-purpose linked list in Rust requires the use of `unsafe`
+code to escape certain automatic checks around aliasing and allocation
+lifetimes. While `unsafe` Rust code is still a lot safer than any C code, it
+raises the spectre of relying on certain areas of Undefined Behavior when you're
+dealing with raw pointers, like in a linked list -- so you run the risk of
+having C-style bugs around dangling pointer dereference, for instance.
+
+It has historically been up to the code's author to convince themselves, and
+readers, that the `unsafe` code is correct and avoids relying on Undefined
+Behavior. Sometimes this is straightforward; often it isn't. In any case,
+"convincing someone it's right" is hard to test in a continuous build, and
+changes to the code in the future can cause your hard-worked proof to silently
+become wrong.
+
+However, the Rust community has been cranking out better tools for situations
+like this -- in particular, [the Miri interpreter][miri]. Miri runs Rust code on
+an "abstract machine" that enforces Rust's compile time rules _at runtime,_ so
+you can't break them even with `unsafe`. (For those with a C background, think
+of Miri as ASan + TSan + UBSan + a bunch of additional analysis that isn't
+possible in C, like runtime borrow checking.)
+
+This presents an opportunity.
+
+## The list from `lilos`
+
+I wrote the [`lilos`] embedded async RTOS in Rust in 2019-20, before Miri was
+mature. In several places, `lilos` really needed intrusive doubly-linked lists,
+for all the reasons I explained in the first section above. So I had to roll
+them by hand using `unsafe`, and convince myself they were right.
+
+Because I'm _very nerdy_ about this sort of thing, I only wound up being
+critically, fatally wrong in two or three places!
+
+In my day job at Oxide Computer, my colleagues have been applying Miri to verify
+code at previously unheard of levels (like an [x86 bootloader][phbl]), and a
+conversation with [Dan Cross][dancrossnyc] inspired me to try applying Miri to
+my various kernels. The first thing I reached for was the linked list from
+`lilos`, for two reasons:
+
+1. It's conveniently standalone. It relies only on `libcore` and no other parts
+   of `lilos`.
+
+2. I haven't seen a fully worked example of a stack-allocated intrusive
+   doubly-linked list in Rust on the internet. (If I had, I would have just used
+   it instead of going to all this trouble.)
+
+Getting the list to pass tests under Miri took some changes to the
+implementation. I'm still not sure whether the changes were fixing actual safety
+bugs that were always lurking in the implementation, or whether they were just
+making Miri's analysis happy -- after all, the tools are not omniscient, and
+fancy computer science things like the [halting problem] prevent them from ever
+being totally perfect.
+
+However, after the changes, the implementation is _far more obviously correct,_
+which I appreciate!
+
+So, in this repo, you'll find a working, Miri-approved, stack-allocated,
+intrusive doubly-linked list implementation, with comments and tests. Is it
+_correct?_ Possibly not; there are aspects of correctness that Miri and my
+ad-hoc tests don't cover. But I think it's pretty close!
+
+I hope someone finds this helpful.
+
+## Appendix: omg why Rust make u do this
+
+Some people on the internet may take this repo and use it to condemn Rust. "Look
+at all this code!" they'll say on sites I don't read. "It's so much simpler to
+do this in C. Rust is silly."
+
+Since I'm not on HackerNews, allow me to prepare a rebuttal:
+
+The point of a safe list API in Rust is that a user could write _arbitrarily
+unwise code_ using the API and, as long as they stick to safe code, the worst
+thing they'll ever encounter is a `panic!` telling them they've messed up. This
+means I don't have to think about all the code in the kernel _using_ lists -- I
+know it's not going to corrupt the kernel.
+
+C only appears simple because it moves all the complexity into your head. It is
+_not possible_ to write a doubly-linked list implementation in C that is safe
+against all possible code using its API. In particular, you can trivially break
+any C intrusive list by just struct-assigning the head or any node to a new
+location. Dangling pointer time!
+
+(You can do only _marginally better_ in C++ through the diligent application of
+move and deleted-copy constructors, but that will not result in less code than
+Rust.)
+
+So, yes, this code is longer than what I'd write in C, and it's worth it to
+simplify every future use case.
+
+[miri]: https://github.com/rust-lang/miri
+[phbl]: https://github.com/oxidecomputer/phbl
+[dancrossnyc]: http://pub.gajendra.net/
+[halting problem]: https://en.wikipedia.org/wiki/Halting_problem
