@@ -254,6 +254,9 @@ macro_rules! create_node {
 ///////////////////////////////////////////////////////////////////////////
 // WaitList implementation
 
+/// Shorthand for `NonNull<Node<T>>`
+type Nnn<T> = NonNull<Node<T>>;
+
 /// A list of `Node`s waiting for something.
 ///
 /// The list *references*, but does not *own*, the nodes. The creator of each
@@ -273,10 +276,11 @@ macro_rules! create_node {
 /// This isn't the only way we could do things, but it is the safest. If you're
 /// curious about the details, see the source code for `Drop`.
 pub struct WaitList<T> {
-    links: Cell<Option<(NonNull<Node<T>>, NonNull<Node<T>>)>>,
+    links: Cell<Option<(Nnn<T>, Nnn<T>)>>,
     _marker: (NotSendMarker, PhantomPinned),
 }
 
+#[allow(clippy::new_without_default)]
 impl<T> WaitList<T> {
     /// Creates a `WaitList` in an initialized, empty state.
     ///
@@ -651,17 +655,15 @@ struct NotSendMarker(PhantomData<*const ()>);
 /// but gives greater assurance against memory safety bugs.
 enum LinkPtr<T> {
     /// A pointer to a node within the list.
-    Inner(NonNull<Node<T>>),
+    Inner(Nnn<T>),
     /// A pointer to the list root.
     End(NonNull<WaitList<T>>),
 }
 
-type NNN<T> = NonNull<Node<T>>;
-
 impl<T> LinkPtr<T> {
     /// Extract the pointer as a node-pointer. If the pointer is to the list
     /// root, returns `None` instead.
-    fn as_node(&self) -> Option<NonNull<Node<T>>> {
+    fn as_node(&self) -> Option<Nnn<T>> {
         if let Self::Inner(p) = self {
             Some(*p)
         } else {
@@ -717,11 +719,15 @@ impl<T> LinkPtr<T> {
 
     /// Implementation factor of `change_{prev,next}` -- rewrite something
     /// through a `LinkPtr` generically.
+    ///
+    /// The signature of this function is kind of a hack, if we could take
+    /// generic functions as higher-kinded we could only take one rewrite fn,
+    /// but we can't.
     unsafe fn change(
         &self,
         neighbor: Self,
         rewrite1: impl FnOnce((Self, Self), Self) -> (Self, Self),
-        rewrite2: impl FnOnce((NNN<T>, NNN<T>), NNN<T>) -> (NNN<T>, NNN<T>),
+        rewrite2: impl FnOnce((Nnn<T>, Nnn<T>), Nnn<T>) -> (Nnn<T>, Nnn<T>),
     ) {
         match self {
             Self::Inner(node) => {
