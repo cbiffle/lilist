@@ -153,8 +153,7 @@ pub struct Node<T> {
     /// Value used to order this node in a list.
     contents: T,
 
-    /// This type should not be inferred as `Send`.
-    _marker: NotSendMarker,
+    _marker: (NotSendMarker, PhantomPinned),
 }
 
 impl<T> Node<T> {
@@ -171,7 +170,7 @@ impl<T> Node<T> {
             links: Cell::default(),
             waker: RefCell::new(waker),
             contents,
-            _marker: NotSendMarker::default(),
+            _marker: (NotSendMarker::default(), PhantomPinned),
         }
     }
 
