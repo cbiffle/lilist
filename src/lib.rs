@@ -1,17 +1,3 @@
-#![warn(
-    elided_lifetimes_in_paths,
-    explicit_outlives_requirements,
-    missing_debug_implementations,
-    missing_docs,
-    semicolon_in_expressions_from_macros,
-    single_use_lifetimes,
-    trivial_casts,
-    trivial_numeric_casts,
-    unaligned_references,
-    unsafe_op_in_unsafe_fn,
-    unreachable_pub,
-    unused_qualifications,
-)]
 
 //! Doubly-linked intrusive lists for scheduling and waking.
 //!
@@ -128,6 +114,21 @@
 // pinned structures, and ensuring that the `Drop` impl of those pinned
 // structures will remove their addresses from any link.
 
+#![warn(
+    elided_lifetimes_in_paths,
+    explicit_outlives_requirements,
+    missing_debug_implementations,
+    missing_docs,
+    semicolon_in_expressions_from_macros,
+    single_use_lifetimes,
+    trivial_casts,
+    trivial_numeric_casts,
+    unaligned_references,
+    unsafe_op_in_unsafe_fn,
+    unreachable_pub,
+    unused_qualifications,
+)]
+
 use core::cell::{Cell, UnsafeCell};
 
 use core::future::Future;
@@ -136,107 +137,8 @@ use core::ptr::NonNull;
 use core::task::{Poll, RawWaker, RawWakerVTable, Waker};
 use core::marker::{PhantomData, PhantomPinned};
 
-/// Zero-sized marker type that can be included to ensure that a data structure
-/// is not automatically made `Send` (i.e. safe for transfer across threads).
-///
-/// This also blocks `Sync`.
-#[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct NotSendMarker(PhantomData<*const ()>);
-
-enum LinkPtr<T> {
-    Inner(NonNull<Node<T>>),
-    End(NonNull<List<T>>),
-}
-
-impl<T> Copy for LinkPtr<T> {}
-impl<T> Clone for LinkPtr<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> PartialEq for LinkPtr<T> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Inner(a), Self::Inner(b)) => a == b,
-            (Self::End(a), Self::End(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-impl<T> Eq for LinkPtr<T> {}
-
-impl<T> core::fmt::Debug for LinkPtr<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Inner(p) => f.debug_tuple("Inner").field(p).finish(),
-            Self::End(p) => f.debug_tuple("End").field(p).finish(),
-        }
-    }
-}
-
-impl<T> LinkPtr<T> {
-    fn as_node(&self) -> Option<NonNull<Node<T>>> {
-        if let Self::Inner(p) = self {
-            Some(*p)
-        } else {
-            None
-        }
-    }
-
-    unsafe fn change_next(&self, next: Self) {
-        match self {
-            // operating on a node
-            Self::Inner(node) => {
-                let node = unsafe { node.as_ref() };
-                let (old_prev, _old_next) = node.links.get().unwrap();
-                node.links.set(Some((old_prev, next)));
-            }
-            // operating on a list
-            Self::End(listptr) => {
-                let list = unsafe { listptr.as_ref() };
-                match next {
-                    Self::End(other_list) => {
-                        // lists can't store list pointers, but this is ok if
-                        // the pointer is identical.
-                        debug_assert!(*listptr == other_list);
-                        // In this case cause the list to become empty.
-                        list.links.set(None);
-                    }
-                    Self::Inner(node) => {
-                        let (old_prev, _old_next) = list.links.get()
-                            .expect("list has become empty, but is about to be \
-                                     made non-empty by detaching a node");
-                        list.links.set(Some((old_prev, node)));
-                    }
-                }
-            }
-        }
-    }
-    unsafe fn change_prev(&self, prev: Self) {
-        match self {
-            Self::Inner(node) => {
-                let node = unsafe { node.as_ref() };
-                let (_old_prev, old_next) = node.links.get().unwrap();
-                node.links.set(Some((prev, old_next)));
-            }
-            Self::End(listptr) => {
-                let list = unsafe { listptr.as_ref() };
-                match prev {
-                    Self::End(other_list) => {
-                        debug_assert!(*listptr == other_list);
-                        list.links.set(None);
-                    }
-                    Self::Inner(node) => {
-                        let (_old_prev, old_next) = list.links.get()
-                            .expect("list has become empty, but is about to be \
-                                     made non-empty by detaching a node");
-                        list.links.set(Some((node, old_next)));
-                    }
-                }
-            }
-        }
-    }
-}
+///////////////////////////////////////////////////////////////////////////
+// Node implementation
 
 /// A node that can be inserted into a [`List`] and used to wait for an event.
 pub struct Node<T> {
@@ -316,6 +218,29 @@ impl<T: core::fmt::Debug> core::fmt::Debug for Node<T> {
             .finish()
     }
 }
+
+/// Creates a pinned node on the stack.
+///
+/// `create_node!(ident, val)` is equivalent to `let ident = ...;` -- it
+/// creates a local variable called `ident`, holding an initialized node. The
+/// node's contents are set to `val`, and its waker is initialized to the
+/// `noop_waker()`.
+///
+/// `create_node!(ident, val, waker)` lets you override the choice of waker, if
+/// you know better.
+#[macro_export]
+macro_rules! create_node {
+    ($var:ident, $dl:expr) => {
+        $crate::create_node!($var, $dl, $crate::noop_waker());
+    };
+    ($var:ident, $dl:expr, $w: expr) => {
+        let $var = $crate::Node::new($dl, $w);
+        pin_utils::pin_mut!($var);
+    };
+}
+
+///////////////////////////////////////////////////////////////////////////
+// List implementation
 
 /// A list of `Node`s.
 ///
@@ -584,7 +509,6 @@ impl<T> List<T> {
 
 /// Operations specific to insertion-orded queues.
 impl List<()> {
-
     /// Wakes the oldest (earliest inserted) waiter on an unsorted list.
     ///
     /// Returns a flag indicating whether anything was done (i.e. whether the
@@ -612,16 +536,6 @@ impl<T> Drop for List<T> {
     }
 }
 
-#[cfg(panic = "abort")]
-fn tolerate_panic(f: impl FnOnce() + core::panic::UnwindSafe) {
-    f()
-}
-
-#[cfg(not(panic = "abort"))]
-fn tolerate_panic(f: impl FnOnce() + core::panic::UnwindSafe) {
-    std::panic::catch_unwind(f).ok();
-}
-
 /// We need a custom `Debug` impl because the inferred one will require `T:
 /// Debug`; since we only print pointers to `T` we don't need to be so
 /// stringent.
@@ -632,6 +546,26 @@ impl<T: core::fmt::Debug> core::fmt::Debug for List<T> {
             .finish()
     }
 }
+
+/// Creates a pinned list on the stack.
+///
+/// `create_list!(ident)` is equivalent to `let ident = ...;` -- it creates a
+/// local variable called `ident`, holding an initialized list.
+#[macro_export]
+macro_rules! create_list {
+    ($var:ident, $t:ty) => {
+        let $var = $crate::List::<$t>::new();
+        pin_utils::pin_mut!($var);
+        // Drop mutability, since we expect the list to be aliased shortly.
+        let $var = $var.into_ref();
+    };
+    ($var:ident) => {
+        $crate::create_list!($var, _)
+    };
+}
+
+///////////////////////////////////////////////////////////////////////////
+// WaitForDetach future implementation.
 
 /// Internal future type used for `insert_and_wait`. Gotta express this as a
 /// named type because it needs a custom `Drop` impl.
@@ -678,41 +612,166 @@ impl<T, F: FnOnce()> Drop for WaitForDetach<'_, T, F> {
     }
 }
 
-/// Creates a pinned list on the stack.
+///////////////////////////////////////////////////////////////////////////
+// Shared utility bits.
+
+/// Zero-sized marker type that can be included to ensure that a data structure
+/// is not automatically made `Send` (i.e. safe for transfer across threads).
 ///
-/// `create_list!(ident)` is equivalent to `let ident = ...;` -- it creates a
-/// local variable called `ident`, holding an initialized list.
-#[macro_export]
-macro_rules! create_list {
-    ($var:ident, $t:ty) => {
-        let $var = $crate::List::<$t>::new();
-        pin_utils::pin_mut!($var);
-        // Drop mutability, since we expect the list to be aliased shortly.
-        let $var = $var.into_ref();
-    };
-    ($var:ident) => {
-        $crate::create_list!($var, _)
-    };
+/// This also blocks `Sync`.
+#[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct NotSendMarker(PhantomData<*const ()>);
+
+/// A link pointer stored in a node.
+///
+/// We implement a circular doubly-linked list, but unlike most such lists, we
+/// don't play type tricks with the pointers at the end. This enum explicitly
+/// records whether each pointer is pointing at a node, or the list root.
+///
+/// This is more expensive than the type-tricks version (by one word per link),
+/// but gives greater assurance against memory safety bugs.
+enum LinkPtr<T> {
+    /// A pointer to a node within the list.
+    Inner(NonNull<Node<T>>),
+    /// A pointer to the list root.
+    End(NonNull<List<T>>),
 }
 
-/// Creates a pinned node on the stack.
-///
-/// `create_node!(ident, val)` is equivalent to `let ident = ...;` -- it
-/// creates a local variable called `ident`, holding an initialized node. The
-/// node's contents are set to `val`, and its waker is initialized to the
-/// `noop_waker()`.
-///
-/// `create_node!(ident, val, waker)` lets you override the choice of waker, if
-/// you know better.
-#[macro_export]
-macro_rules! create_node {
-    ($var:ident, $dl:expr) => {
-        $crate::create_node!($var, $dl, $crate::noop_waker());
-    };
-    ($var:ident, $dl:expr, $w: expr) => {
-        let $var = $crate::Node::new($dl, $w);
-        pin_utils::pin_mut!($var);
-    };
+type NNN<T> = NonNull<Node<T>>;
+
+impl<T> LinkPtr<T> {
+    /// Extract the pointer as a node-pointer. If the pointer is to the list
+    /// root, returns `None` instead.
+    fn as_node(&self) -> Option<NonNull<Node<T>>> {
+        if let Self::Inner(p) = self {
+            Some(*p)
+        } else {
+            None
+        }
+    }
+
+    /// Rewrites the "next" pointer in the object pointed to by `self` to point
+    /// instead to `next`.
+    ///
+    /// # Safety
+    ///
+    /// This will dereference the pointer held in `self`, so all the usual rules
+    /// about safe dereferencing of a pointer apply.
+    ///
+    /// In addition, to be used safely, this must not subvert the Link Valid
+    /// Invariant on the overall List/Node type family, which means that `next`
+    /// must be a valid pointer and must point to either another node in the
+    /// same list as the one pointed to by `self`, or the list root reachable
+    /// from `self`.
+    unsafe fn change_next(&self, next: Self) {
+        fn replace_next<T>((prev, _next): (T, T), new: T) -> (T, T) {
+            (prev, new)
+        }
+
+        unsafe {
+            self.change(next, replace_next, replace_next);
+        }
+    }
+
+    /// Rewrites the "prev" pointer in the object pointed to by `self` to point
+    /// instead to `prev`.
+    ///
+    /// # Safety
+    ///
+    /// This will dereference the pointer held in `self`, so all the usual rules
+    /// about safe dereferencing of a pointer apply.
+    ///
+    /// In addition, to be used safely, this must not subvert the Link Valid
+    /// Invariant on the overall List/Node type family, which means that `prev`
+    /// must be a valid pointer and must point to either another node in the
+    /// same list as the one pointed to by `self`, or the list root reachable
+    /// from `self`.
+    unsafe fn change_prev(&self, prev: Self) {
+        fn replace_prev<T>((_prev, next): (T, T), new: T) -> (T, T) {
+            (new, next)
+        }
+
+        unsafe {
+            self.change(prev, replace_prev, replace_prev);
+        }
+    }
+
+    /// Implementation factor of `change_{prev,next}` -- rewrite something
+    /// through a `LinkPtr` generically.
+    unsafe fn change(
+        &self,
+        neighbor: Self,
+        rewrite1: impl FnOnce((Self, Self), Self) -> (Self, Self),
+        rewrite2: impl FnOnce((NNN<T>, NNN<T>), NNN<T>) -> (NNN<T>, NNN<T>),
+    ) {
+        match self {
+            Self::Inner(node) => {
+                let node = unsafe { node.as_ref() };
+                let orig_links = node.links.get().unwrap();
+                node.links.set(Some(rewrite1(orig_links, neighbor)));
+            }
+            Self::End(listptr) => {
+                let list = unsafe { listptr.as_ref() };
+                match neighbor {
+                    Self::End(other_list) => {
+                        debug_assert!(*listptr == other_list);
+                        list.links.set(None);
+                    }
+                    Self::Inner(node) => {
+                        let list_heads = list.links.get()
+                            .expect("list has become empty, but is about to be \
+                                     made non-empty by detaching a node");
+                        list.links.set(Some(rewrite2(list_heads, node)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Force `Copy` whether or not `T` is `Copy`.
+impl<T> Copy for LinkPtr<T> {}
+/// Force `Clone` whether or not `T` is `Clone`.
+impl<T> Clone for LinkPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+/// Implement equality independent of `T` since we just compare pointers.
+/// Equality of `LinkPtr` is only used in integrity checks.
+impl<T> PartialEq for LinkPtr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Inner(a), Self::Inner(b)) => a == b,
+            (Self::End(a), Self::End(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl<T> Eq for LinkPtr<T> {}
+
+/// Implement `Debug` independent of `T` since we only print addresses.
+impl<T> core::fmt::Debug for LinkPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Inner(p) => f.debug_tuple("Inner").field(p).finish(),
+            Self::End(p) => f.debug_tuple("End").field(p).finish(),
+        }
+    }
+}
+
+/// Execute a function without propagating panics, `panic = "abort"` edition.
+/// (This just calls the function.)
+#[cfg(panic = "abort")]
+fn tolerate_panic(f: impl FnOnce() + core::panic::UnwindSafe) {
+    f()
+}
+
+/// Execute a function without propagating panics, `panic = "unwind"` edition.
+/// This catches unwinding and requires `std`.
+#[cfg(not(panic = "abort"))]
+fn tolerate_panic(f: impl FnOnce() + core::panic::UnwindSafe) {
+    std::panic::catch_unwind(f).ok();
 }
 
 /// A `Waker` that does nothing. This is useful if you need a dummy `Waker` that
