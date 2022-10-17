@@ -1,5 +1,19 @@
 # Intrusive stack-allocated doubly-linked list example
 
+## Quickstart
+
+```
+cargo test
+```
+
+Or to run the tests under [Miri][miri]:
+
+```
+rustup toolchain install nightly    # if you haven't already
+rustup component add --toolchain nightly miri
+cargo +nightly miri test
+```
+
 ## Background
 
 In kernel/RTOS environments in C, there's a common pattern for managing things
