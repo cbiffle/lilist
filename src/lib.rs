@@ -117,6 +117,11 @@
 // of pinned structures, and ensuring that the `Drop` impl of those pinned
 // structures will remove their addresses from any link.
 
+// We can be no_std in the general case, but if you build with unwinding on,
+// we'll catch panics in certain cases to ensure that invariants hold. This
+// requires std.
+#![cfg_attr(not(panic = "unwind"), no_std)]
+
 #![warn(
     elided_lifetimes_in_paths,
     explicit_outlives_requirements,

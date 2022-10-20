@@ -7,3 +7,6 @@ edition = "2021"
 
 [dependencies]
 pin-utils = "0.1.0"
+
+[profile.dev]
+panic = "abort"

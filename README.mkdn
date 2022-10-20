@@ -11,8 +11,12 @@ Or to run the tests under [Miri][miri]:
 ```
 rustup toolchain install nightly    # if you haven't already
 rustup component add --toolchain nightly miri
-cargo +nightly miri test
+
+./run-tests-under-miri.sh
 ```
+
+(Note: as of 2022-10-20, one of the tests relies on a Miri fix that is merged
+but not yet released in nightly.)
 
 ## Background
 
