@@ -15,8 +15,8 @@ rustup component add --toolchain nightly miri
 ./run-tests-under-miri.sh
 ```
 
-(Note: as of 2022-10-20, one of the tests relies on a Miri fix that is merged
-but not yet released in nightly.)
+(Note: you will need a nightly toolchain released after roughly 2022-11-01 for
+this to work.)
 
 ## Background
 
