@@ -5,6 +5,7 @@
 //!
 //! To use: `cargo +nightly miri run --bin no_std`
 
+#![allow(internal_features)]
 #![feature(start, core_intrinsics, lang_items)]
 #![no_std]
 

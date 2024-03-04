@@ -131,7 +131,6 @@
     single_use_lifetimes,
     trivial_casts,
     trivial_numeric_casts,
-    unaligned_references,
     unsafe_op_in_unsafe_fn,
     unreachable_pub,
     unused_qualifications,
@@ -836,7 +835,7 @@ mod tests {
     use super::*;
 
     use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-    use core::task::{Context, RawWaker, RawWakerVTable};
+    use core::task::Context;
     use std::sync::Arc;
 
     /// Performs a list structural integrity check, panics if any issues are
