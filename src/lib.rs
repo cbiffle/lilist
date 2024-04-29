@@ -39,50 +39,15 @@
 //! structures, all operations require that they be
 //! [pinned](https://doc.rust-lang.org/core/pin/). Because we don't use the
 //! heap, we provide ways to create and use pinned data structures on the stack.
-//! This is a wee bit involved, but we provide convenience macros to help.
 //!
 //! Here is an example of creating a `Node` and joining an existing list, which
 //! is the most common use case in user code:
 //!
 //! ```rust
-//! # use lilist::{create_list, create_node, noop_waker};
+//! # use lilist::Node;
 //! # async fn foo() {
-//! # create_list!(wait_list);
-//! // This creates a local variable called "my_node"
-//! create_node!(my_node, (), noop_waker());
-//!
-//! // Join a wait list
-//! wait_list.insert_and_wait(my_node.as_mut()).await;
-//!
-//! // All done, my_node can be dropped
-//! # }
-//! ```
-//!
-//! Behind the scenes, creating a list or node is a two-step process. We'll
-//! use `Node` as a running example here, but the same applies to `WaitList`.
-//!
-//! 1. Create the node using [`Node::new`]. This will get you a bare `Node`,
-//!    which is not very useful yet.
-//!
-//! 2. Put the `Node` in its final resting place (which may be a local, or might
-//!    be a field of a struct, etc.) and pin a reference to it. The
-//!    [`pin_mut!`](https://docs.rs/pin-utils/0.1/pin_utils/macro.pin_mut.html)
-//!    macro makes doing this on the stack easier.
-//!
-//! (In the `WaitList` case you'll usually also want to drop exclusivity by
-//! calling `Pin::into_ref`.)
-//!
-//! So, with that in mind, the fully-manual version of the example above reads
-//! as follows:
-//!
-//! ```
-//! # use lilist::{create_list, Node, noop_waker};
-//! # async fn foo() {
-//! # create_list!(wait_list);
-//! // Create the node.
-//! let my_node = Node::new((), noop_waker());
-//! // Shadow the local binding with a pinned version.
-//! pin_utils::pin_mut!(my_node);
+//! # lilist::create_list!(wait_list);
+//! let mut my_node = core::pin::pin!(Node::new(()));
 //!
 //! // Join a wait list
 //! wait_list.insert_and_wait(my_node.as_mut()).await;
@@ -136,13 +101,23 @@
     unused_qualifications,
 )]
 
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
 
 use core::future::Future;
 use core::pin::Pin;
 use core::ptr::NonNull;
 use core::task::{Poll, RawWaker, RawWakerVTable, Waker};
 use core::marker::{PhantomData, PhantomPinned};
+
+/// Marker trait implementing the "Captures Trick" from Rust RFC 3498, ensuring
+/// that we do lifetime capturing right in the 2021 edition.
+///
+/// TODO: revisit this when we can switch to the 2024 edition, where the default
+/// behavior makes this less necessary.
+pub trait Captures<T> {}
+
+impl<U: ?Sized, T> Captures<T> for U {}
+
 
 ///////////////////////////////////////////////////////////////////////////
 // Node implementation
@@ -156,7 +131,7 @@ pub struct Node<T> {
     /// `None`.
     links: Cell<Option<(LinkPtr<T>, LinkPtr<T>)>>,
     /// Waker to poke when this node is kicked out of a list.
-    waker: RefCell<Waker>,
+    waker: Cell<Option<Waker>>,
     /// Value used to order this node in a list.
     contents: T,
 
@@ -164,18 +139,11 @@ pub struct Node<T> {
 }
 
 impl<T> Node<T> {
-    /// Creates a new `Node` containing `contents` as its value, and poking
-    /// `waker` when it is kicked out of a list.
-    ///
-    /// It's often unclear what `Waker` to pass here, because async runtimes
-    /// mostly hide wakers behind the curtain. This module provides
-    /// `noop_waker()` as a safe universal choice. When you use
-    /// `insert_and_wait` with this node later, that function will replace the
-    /// node's waker with the appropriate one from your runtime.
-    pub fn new(contents: T, waker: Waker) -> Self {
+    /// Creates a new `Node` containing `contents` as its value.
+    pub fn new(contents: T) -> Self {
         Self {
             links: Cell::default(),
-            waker: RefCell::new(waker),
+            waker: Cell::new(None),
             contents,
             _marker: (NotSendMarker::default(), PhantomPinned),
         }
@@ -184,7 +152,7 @@ impl<T> Node<T> {
     /// Disconnects a node from any list. This is idempotent.
     ///
     /// This does _not_ poke the waker.
-    pub fn detach(self: Pin<&Self>) {
+    pub fn detach(self: Pin<&Self>) -> Option<Waker> {
         // TODO: it's not clear that this operation needs to require Pin. It's
         // safe if called on a non-pinned node, since by definition if a node is
         // not pinned it isn't in a list.
@@ -197,17 +165,10 @@ impl<T> Node<T> {
                 prev.change_next(next);
                 next.change_prev(prev);
             }
+            self.waker.take()
+        } else {
+            None
         }
-    }
-
-    /// Pokes the node's waker.
-    ///
-    /// In applications where unwinding is on, any panics in the waker will be
-    /// discarded. (In applications that abort on panic, panics will abort as
-    /// usual.)
-    fn wake(&self) {
-        let waker = &*self.waker.borrow();
-        tolerate_panic(|| waker.wake_by_ref());
     }
 
     /// Checks if a node is detached.
@@ -235,26 +196,6 @@ impl<T: core::fmt::Debug> core::fmt::Debug for Node<T> {
             .field("contents", &self.contents)
             .finish()
     }
-}
-
-/// Creates a pinned node on the stack.
-///
-/// `create_node!(ident, val)` is equivalent to `let ident = ...;` -- it
-/// creates a local variable called `ident`, holding an initialized node. The
-/// node's contents are set to `val`, and its waker is initialized to the
-/// `noop_waker()`.
-///
-/// `create_node!(ident, val, waker)` lets you override the choice of waker, if
-/// you know better.
-#[macro_export]
-macro_rules! create_node {
-    ($var:ident, $dl:expr) => {
-        $crate::create_node!($var, $dl, $crate::noop_waker());
-    };
-    ($var:ident, $dl:expr, $w: expr) => {
-        let $var = $crate::Node::new($dl, $w);
-        pin_utils::pin_mut!($var);
-    };
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -292,16 +233,13 @@ impl<T> WaitList<T> {
     ///
     /// In this state, the list is not very useful. To access most of its API,
     /// you must pin it. The simplest way to do this properly is with the
-    /// `pin_utils` crate, though because it assumes you want an exclusive
-    /// reference to the pinned value, you'll also want to call `Pin::into_ref`,
-    /// like so:
+    /// `pin!` macro, though because it assumes you want an exclusive reference
+    /// to the pinned value, you'll also want to call `Pin::into_ref`, like so:
     ///
     /// ```
     /// # use lilist::WaitList;
     /// // create the list on the stack
-    /// let list = WaitList::<()>::new();
-    /// // pin it in-place
-    /// pin_utils::pin_mut!(list);
+    /// let list = core::pin::pin!(WaitList::<()>::new());
     /// // drop exclusivity
     /// let list = list.into_ref();
     /// ```
@@ -353,10 +291,10 @@ impl<T: PartialOrd> WaitList<T> {
     ///
     /// If `node` is not detached (if it's in another list) when this is called.
     /// This indicates a bug in the list implementation, and not your code.
-    pub fn insert_and_wait<'a>(
-        self: Pin<&Self>,
-        node: Pin<&'a mut Node<T>>,
-    ) -> impl Future<Output = ()> + 'a {
+    pub fn insert_and_wait<'list, 'node>(
+        self: Pin<&'list Self>,
+        node: Pin<&'node mut Node<T>>,
+    ) -> impl Future<Output = ()> + Captures<(&'list Self, &'node mut Node<T>)> {
         self.insert_and_wait_with_cleanup(
             node,
             || (),
@@ -403,11 +341,11 @@ impl<T: PartialOrd> WaitList<T> {
     ///
     /// If `node` is not detached (if it's in another list) when this is called.
     /// This indicates a bug in the list implementation, and not your code.
-    pub fn insert_and_wait_with_cleanup<'node, F: 'node + FnOnce()>(
-        self: Pin<&Self>,
+    pub fn insert_and_wait_with_cleanup<'list, 'node, F: FnOnce()>(
+        self: Pin<&'list Self>,
         node: Pin<&'node mut Node<T>>,
         cleanup: F,
-    ) -> impl Future<Output = ()> + 'node {
+    ) -> impl Future<Output = ()> + Captures<(&'list Self, &'node mut Node<T>)> {
         // We required `node` to be `mut` to prove exclusive ownership, but we
         // don't actually need to mutate it -- and we're going to alias it. So,
         // downgrade.
@@ -502,8 +440,9 @@ impl<T: PartialOrd> WaitList<T> {
             // Copy the next pointer before detaching, since it's about to go
             // away.
             let next = cref.links.get().expect("node in list without links").1;
-            cref.detach();
-            cref.wake();
+            if let Some(waker) = cref.detach() {
+                waker.wake();
+            }
 
             candidate = next.as_node();
         }
@@ -522,8 +461,9 @@ impl<T> WaitList<T> {
             // Copy the next pointer before detaching, since it's about to go
             // away.
             let next = cref.links.get().expect("node in list without links").1;
-            cref.detach();
-            cref.wake();
+            if let Some(waker) = cref.detach() {
+                waker.wake();
+            }
 
             candidate = next.as_node();
         }
@@ -540,8 +480,9 @@ impl WaitList<()> {
         if let Some((candidate, _front)) = self.links.get() {
             // Safety: Link Valid Invariant
             let cref = unsafe { Pin::new_unchecked(candidate.as_ref()) };
-            cref.detach();
-            cref.wake();
+            if let Some(waker) = cref.detach() {
+                waker.wake();
+            }
             true
         } else {
             false
@@ -552,16 +493,7 @@ impl WaitList<()> {
 impl<T> Drop for WaitList<T> {
     fn drop(&mut self) {
         if self.links.get().is_some() {
-            // Safety: If this list is not empty, it must have been pinned,
-            // since that's the only way you can insert things. Any other pinned
-            // references to it will have gone away (since we've gotten to
-            // drop). Thus we can pin our sole reference here and trivially meet
-            // Pin's guarantees by not moving `self` until we finish this
-            // function.
-            let this = unsafe { Pin::new_unchecked(&*self) };
-
-            // Detach all nodes so they aren't left with dangling pointers.
-            this.wake_all();
+            panic!();
         }
     }
 }
@@ -584,8 +516,7 @@ impl<T: core::fmt::Debug> core::fmt::Debug for WaitList<T> {
 #[macro_export]
 macro_rules! create_list {
     ($var:ident, $t:ty) => {
-        let $var = $crate::WaitList::<$t>::new();
-        pin_utils::pin_mut!($var);
+        let $var = core::pin::pin!($crate::WaitList::<$t>::new());
         // Drop mutability, since we expect the list to be aliased shortly.
         let $var = $var.into_ref();
     };
@@ -618,9 +549,9 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, T, F> {
             self.polled_since_detach.set(true);
             Poll::Ready(())
         } else {
-            // The node remains attached to the list. The waker may have
-            // changed. Update it.
-            *self.node.waker.borrow_mut() = cx.waker().clone();
+            // The node remains attached to the list. Capture the current task's
+            // waker.
+            self.node.waker.set(Some(cx.waker().clone()));
             Poll::Pending
         }
     }
@@ -791,20 +722,6 @@ impl<T> core::fmt::Debug for LinkPtr<T> {
     }
 }
 
-/// Execute a function without propagating panics, `panic = "abort"` edition.
-/// (This just calls the function.)
-#[cfg(panic = "abort")]
-fn tolerate_panic(f: impl FnOnce() + core::panic::UnwindSafe) {
-    f()
-}
-
-/// Execute a function without propagating panics, `panic = "unwind"` edition.
-/// This catches unwinding and requires `std`.
-#[cfg(not(panic = "abort"))]
-fn tolerate_panic(f: impl FnOnce() + core::panic::UnwindSafe) {
-    std::panic::catch_unwind(f).ok();
-}
-
 /// A `Waker` that does nothing. This is useful if you need a dummy `Waker` that
 /// is independent of your choice of async runtimes, etc.
 ///
@@ -834,6 +751,7 @@ pub fn noop_waker() -> Waker {
 mod tests {
     use super::*;
 
+    use core::pin::pin;
     use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
     use core::task::Context;
     use std::sync::Arc;
@@ -937,23 +855,6 @@ mod tests {
         (w, clone)
     }
 
-
-    /// Makes a `Waker` that will panic if used in any way other than being dropped.
-    fn exploding_waker() -> Waker {
-        static EXPLODING_VTABLE: RawWakerVTable = RawWakerVTable::new(
-            |x| RawWaker::new(x, &EXPLODING_VTABLE), // clone
-            |_| panic!("EXPLODING WAKER"), // wake
-            |_| panic!("EXPLODING WAKER"), // wake_by_ref
-            |_| (),  // drop
-        );
-
-        // Safety: the EXPLODING_VTABLE doesn't dereference the context pointer at
-        // all, so we could pass literally anything here and be safe.
-        unsafe {
-            Waker::from_raw(RawWaker::new(core::ptr::null(), &EXPLODING_VTABLE))
-        }
-    }
-
     #[test]
     fn hes_making_a_list() {
         create_list!(list, ());
@@ -976,13 +877,14 @@ mod tests {
 
     #[test]
     fn create_and_drop_node() {
-        create_node!(_node, (), exploding_waker());
+        let _node = pin!(Node::new(()));
     }
 
     #[test]
     fn insert_and_cancel_future() {
         create_list!(list, ());
-        create_node!(node, (), exploding_waker());
+
+        let mut node = pin!(Node::new(()));
 
         let fut = list.insert_and_wait(node.as_mut());
         check(list.as_ref());
@@ -994,7 +896,7 @@ mod tests {
     #[test]
     fn reuse_node_after_cancellation() {
         create_list!(list, ());
-        create_node!(node, (), exploding_waker());
+        let mut node = pin!(Node::new(()));
 
         let fut = list.insert_and_wait(node.as_mut());
         drop(fut);
@@ -1008,11 +910,11 @@ mod tests {
     #[test]
     fn insert_two_and_cancel_out_of_order() {
         create_list!(list, ());
-        create_node!(node1, (), exploding_waker());
+        let mut node1 = pin!(Node::new(()));
 
         let node1_fut = list.insert_and_wait(node1.as_mut());
 
-        create_node!(node2, (), exploding_waker());
+        let mut node2 = pin!(Node::new(()));
         let node2_fut = list.insert_and_wait(node2.as_mut());
 
         drop(node1_fut);
@@ -1027,10 +929,9 @@ mod tests {
         create_list!(list, ());
         {
             let (w, wake_count) = spy_waker();
-            create_node!(node, (), exploding_waker());
+            let node = pin!(Node::new(()));
 
-            let node1_wait = list.insert_and_wait(node);
-            pin_utils::pin_mut!(node1_wait);
+            let mut node1_wait = pin!(list.insert_and_wait(node));
             let mut ctx = Context::from_waker(&w);
 
             // We can poll the insert future all we want but it doesn't resolve
@@ -1054,7 +955,7 @@ mod tests {
     fn insert_and_cancel_with_cleanup_action() {
         create_list!(list, ());
 
-        create_node!(node, (), exploding_waker());
+        let mut node = pin!(Node::new(()));
 
         // Flag we'll update from our cleanup action to detect that it's been
         // run.
@@ -1062,11 +963,10 @@ mod tests {
 
         {
             // Insert with cleanup closure.
-            let fut = list.insert_and_wait_with_cleanup(
+            let fut = pin!(list.insert_and_wait_with_cleanup(
                 node.as_mut(),
                 || future_dropped.store(true, Ordering::Relaxed),
-            );
-            pin_utils::pin_mut!(fut);
+            ));
 
             // Future is currently in the "node attached, never polled"
             // state.
@@ -1107,20 +1007,16 @@ mod tests {
             // Create a collection of four nodes with varying values. We expect
             // the list to maintain these in ascending order, regardless of the
             // order in which we insert them.
-            create_node!(node1, 1u32, exploding_waker());
-            create_node!(node2, 2u32, exploding_waker());
-            create_node!(node3, 3u32, exploding_waker());
-            create_node!(node4, 4u32, exploding_waker());
+            let mut node1 = pin!(Node::new(1u32));
+            let mut node2 = pin!(Node::new(2u32));
+            let mut node3 = pin!(Node::new(3u32));
+            let mut node4 = pin!(Node::new(4u32));
 
             // Insert them in shuffled order.
-            let node2_fut = list.insert_and_wait(node2.as_mut());
-            pin_utils::pin_mut!(node2_fut);
-            let node4_fut = list.insert_and_wait(node4.as_mut());
-            pin_utils::pin_mut!(node4_fut);
-            let node3_fut = list.insert_and_wait(node3.as_mut());
-            pin_utils::pin_mut!(node3_fut);
-            let node1_fut = list.insert_and_wait(node1.as_mut());
-            pin_utils::pin_mut!(node1_fut);
+            let mut node2_fut = pin!(list.insert_and_wait(node2.as_mut()));
+            let mut node4_fut = pin!(list.insert_and_wait(node4.as_mut()));
+            let mut node3_fut = pin!(list.insert_and_wait(node3.as_mut()));
+            let mut node1_fut = pin!(list.insert_and_wait(node1.as_mut()));
 
             // Set up minimal async runtime state to poll them.
             let (w, wake_count) = spy_waker();
@@ -1173,20 +1069,16 @@ mod tests {
         create_list!(list);
         {
             // Make four nodes.
-            create_node!(node1, (), exploding_waker());
-            create_node!(node2, (), exploding_waker());
-            create_node!(node3, (), exploding_waker());
-            create_node!(node4, (), exploding_waker());
+            let mut node1 = pin!(Node::new(()));
+            let mut node2 = pin!(Node::new(()));
+            let mut node3 = pin!(Node::new(()));
+            let mut node4 = pin!(Node::new(()));
 
             // Insert them in order, so node1 is oldest.
-            let node1_fut = list.insert_and_wait(node1.as_mut());
-            pin_utils::pin_mut!(node1_fut);
-            let node2_fut = list.insert_and_wait(node2.as_mut());
-            pin_utils::pin_mut!(node2_fut);
-            let node3_fut = list.insert_and_wait(node3.as_mut());
-            pin_utils::pin_mut!(node3_fut);
-            let node4_fut = list.insert_and_wait(node4.as_mut());
-            pin_utils::pin_mut!(node4_fut);
+            let mut node1_fut = pin!(list.insert_and_wait(node1.as_mut()));
+            let mut node2_fut = pin!(list.insert_and_wait(node2.as_mut()));
+            let mut node3_fut = pin!(list.insert_and_wait(node3.as_mut()));
+            let mut node4_fut = pin!(list.insert_and_wait(node4.as_mut()));
 
             // Set up minimal async runtime state to poll them.
             let (w, wake_count) = spy_waker();
@@ -1227,22 +1119,5 @@ mod tests {
             assert_eq!(node4_fut.as_mut().poll(&mut ctx), Poll::Ready(()));
             assert_eq!(wake_count.load(Ordering::Relaxed), 4);
         }
-    }
-
-    #[test]
-    fn drop_non_empty_list() {
-        let (waker, wake_count) = spy_waker();
-        let node1 = Node::new((), waker);
-        pin_utils::pin_mut!(node1);
-
-        let fut = {
-            let list = WaitList::<()>::new();
-            pin_utils::pin_mut!(list);
-
-            list.as_ref().insert_and_wait(node1)
-        }; // list gets dropped here while non-empty!
-
-        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
-        drop(fut);
     }
 }
