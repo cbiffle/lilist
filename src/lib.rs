@@ -101,7 +101,7 @@
     unused_qualifications,
 )]
 
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 
 use core::future::Future;
 use core::pin::Pin;
@@ -153,7 +153,8 @@ impl<T> Node<T> {
 
     /// Disconnects a node from any list. This is idempotent.
     ///
-    /// This does _not_ poke the waker.
+    /// This does _not_ poke the waker, but returns it if one was present (which
+    /// should occur exactly when this node is in a list).
     fn detach(self: Pin<&Self>) -> Option<Waker> {
         // TODO: it's not clear that this operation needs to require Pin. It's
         // safe if called on a non-pinned node, since by definition if a node is
@@ -180,8 +181,8 @@ impl<T> Node<T> {
 }
 
 /// A `Node` will check that it isn't still in a list on drop, and panic if it
-/// is. This shouldn't be possible under normal circumstances, since dropping a
-/// node means that it's not currently owned by a list insertion future.
+/// is. This shouldn't be possible if the wait future is correct, since dropping
+/// a node means that it's not currently owned by a list insertion future.
 impl<T> Drop for Node<T> {
     fn drop(&mut self) {
         assert!(self.is_detached());
@@ -206,11 +207,14 @@ impl<T: core::fmt::Debug> core::fmt::Debug for Node<T> {
 /// Shorthand for `NonNull<Node<T>>`
 type Nnn<T> = NonNull<Node<T>>;
 
-/// A list of `Node`s waiting for something.
+/// A list of waiters, waiting for something.
 ///
-/// The list *references*, but does not *own*, the nodes. The creator of each
-/// node keeps ownership of it. This is okay because, before the creator can
-/// drop the node, the node will remove itself from the list.
+/// The list *references*, but does not *own*, the nodes. The nodes are owned by
+/// the wait futures (returned by [`wait`]/[`wait_with_cleanup`]), and the
+/// creator of those futures own them. This is okay because the futures must be
+/// pinned to join the list, and this means we can be sure their drop impls
+/// (which will detach the nodes from the list) will run before the memory is
+/// repurposed or moved.
 ///
 /// Because lists contain self-referential pointers, creating one is somewhat
 /// involved. Use the [`create_list!`] macro when possible, or see
@@ -222,8 +226,9 @@ type Nnn<T> = NonNull<Node<T>>;
 /// Dropping a list without emptying it is treated as a programming error, and
 /// will panic.
 ///
-/// This isn't the only way we could do things, but it is the safest. If you're
-/// curious about the details, see the source code for `Drop`.
+/// That being said, because the wait-futures that keep nodes in the list borrow
+/// the list, it should be impossible to drop the list while there's anything in
+/// it.
 pub struct WaitList<T> {
     links: Cell<Option<(Nnn<T>, Nnn<T>)>>,
     _marker: (NotSendMarker, PhantomPinned),
@@ -306,7 +311,7 @@ impl<T: PartialOrd> WaitList<T> {
         cleanup: F,
     ) -> impl Future<Output = ()> + Captures<&'list Self> {
         WaitForDetach2 {
-            node: Node::new(contents),
+            node: UnsafeCell::new(Node::new(contents)),
             list: self,
             state: Cell::new(WaitState::NotYetAttached),
             cleanup: Some(cleanup),
@@ -427,14 +432,42 @@ macro_rules! create_list {
 ///////////////////////////////////////////////////////////////////////////
 // WaitForDetach2 future implementation.
 
-/// Internal future type used for `insert_and_wait`. Gotta express this as a
-/// named type because it needs a custom `Drop` impl.
+/// Internal future type used for `wait`.
 #[pin_project(PinnedDrop)]
 struct WaitForDetach2<'list, T, F: FnOnce()> {
+    /// The Node we use to join the list, once we decide to do that. There are a
+    /// couple odd things going on here that are worth pointing out.
+    ///
+    /// First: the Node is in an `UnsafeCell`. This is an attempt at "reference
+    /// breaking" to ensure that holding a `Pin<&mut WaitForDetach2>` does not
+    /// imply the possibility of generating a `Pin<&mut Node>`. This is
+    /// important, because while the Node is in a list, it's referenced by the
+    /// link pointers, and code for e.g. waking a node in the list will generate
+    /// ephemeral `&` references to the Node. This would imply aliasing the
+    /// implied `&mut` path to the Node from `Pin<&mut WaitForDetach2>`, which
+    /// would be bad. So, `UnsafeCell`.
+    ///
+    /// Second: despite being in an `UnsafeCell`, this is still tagged as
+    /// `#[pin]`. This is a second safety measure, since it prevents us from
+    /// getting a direct `&mut UnsafeCell` out of the `project` operation, which
+    /// could let us overwrite it. Instead we get a `Pin<&mut UnsafeCell>` which
+    /// we immediately degrade to a `&UnsafeCell` before re-pinning its contents
+    /// as a `Pin<&Node<T>>`. This is not a soundness issue so much as a "make
+    /// internal implementation harder to break during maintenance" feature.
     #[pin]
-    node: Node<T>,
+    node: UnsafeCell<Node<T>>,
+    /// Reference to the list we're borrowing. This reference serves two
+    /// purposes.
+    ///
+    /// First, we use it on first poll to insert our `Node` into the list.
+    ///
+    /// Second, it ensures that we borrow the list for our entire existence,
+    /// which makes it impossible to drop a list while nodes are in it.
     list: Pin<&'list WaitList<T>>,
+    /// Tracking poll state.
     state: Cell<WaitState>,
+    /// Cleanup action; this is always set to `Some`, but we `take` it to run it
+    /// for simplicity, so this becomes `None` during drop, sometimes.
     cleanup: Option<F>,
 }
 
@@ -454,12 +487,21 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
         -> Poll<Self::Output>
     {
         let p = self.project();
+        // Ensure that we can only produce a Pin<&> to the node.
+        //
+        // Safety: this is unsafe for two reasons. First, we are dereferencing a
+        // raw pointer to access the contents of the UnsafeCell, which
+        // effectively bypasses the borrow checker. We only ever produce
+        // _shared_ references into the UnsafeCell, making this okay.
+        // Second, we are pinning the result. We are basically implementing our
+        // own pin projection through the UnsafeCell, converting a `Pin<&mut
+        // UnsafeCell<T>>` to a `Pin<&T>`. 
+        let node = unsafe { Pin::new_unchecked(&*p.node.as_ref().get()) };
         match p.state.get() {
             WaitState::NotYetAttached => {
                 // Do the insertion part. This used to be a separate `insert` function,
                 // but that function had soundness risks and so I've inlined it.
 
-                let node = p.node.as_ref();
                 let nnn = NonNull::from(&*node);
                 {
                     // Node should not already belong to a list.
@@ -519,12 +561,12 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
                     }
                 }
                 p.state.set(WaitState::Attached);
-                p.node.waker.set(Some(cx.waker().clone()));
+                node.waker.set(Some(cx.waker().clone()));
                 Poll::Pending
             }
             WaitState::Attached => {
                 // See if we've detached.
-                if p.node.is_detached() {
+                if node.is_detached() {
                     // The node is not attached to any list, but we're still borrowing
                     // it until we're dropped, so we don't need to replace the node
                     // field contents -- just set a flag to skip work in the Drop impl.
@@ -533,7 +575,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
                 } else {
                     // The node remains attached to the list. While unlikely, it's
                     // possible that the waker has changed. Update it.
-                    p.node.waker.set(Some(cx.waker().clone()));
+                    node.waker.set(Some(cx.waker().clone()));
                     Poll::Pending
                 }
             }
@@ -547,8 +589,18 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
 impl<T, F: FnOnce()> PinnedDrop for WaitForDetach2<'_, T, F> {
     fn drop(self: Pin<&mut Self>) {
         let p = self.project();
+        // Ensure that we can only produce a Pin<&> to the node.
+        //
+        // Safety: this is unsafe for two reasons. First, we are dereferencing a
+        // raw pointer to access the contents of the UnsafeCell, which
+        // effectively bypasses the borrow checker. We only ever produce
+        // _shared_ references into the UnsafeCell, making this okay.
+        // Second, we are pinning the result. We are basically implementing our
+        // own pin projection through the UnsafeCell, converting a `Pin<&mut
+        // UnsafeCell<T>>` to a `Pin<&T>`. 
+        let node = unsafe { Pin::new_unchecked(&*p.node.as_ref().get()) };
         if p.state.get() == WaitState::Attached {
-            if p.node.is_detached() {
+            if node.is_detached() {
                 // Uh oh, we have not had a chance to handle the detach.
                 if let Some(cleanup) = p.cleanup.take() {
                     cleanup();
@@ -556,7 +608,7 @@ impl<T, F: FnOnce()> PinnedDrop for WaitForDetach2<'_, T, F> {
             } else {
                 // If _we_ detach ourselves, we don't run the cleanup
                 // action.
-                p.node.as_ref().detach();
+                node.detach();
             }
         }
     }
