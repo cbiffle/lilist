@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#![allow(clippy::bool_assert_comparison)]
+
 //! Doubly-linked intrusive lists for scheduling and waking.
 //!
 //! A [`WaitList<T>`][WaitList] keeps track of nodes (of type [`Node<T>`][Node])
@@ -350,71 +352,11 @@ impl<T: PartialOrd> WaitList<T> {
         // don't actually need to mutate it -- and we're going to alias it. So,
         // downgrade.
         let node = node.into_ref();
-        // Do the insertion part. This used to be a separate `insert` function,
-        // but that function had soundness risks and so I've inlined it.
-
-        let nnn = NonNull::from(&*node);
-        {
-            // Node should not already belong to a list.
-            assert!(node.is_detached());
-
-            // Work through the nodes starting at the head, looking for the
-            // future `next` of `node`.
-            let mut candidate = self.links.get().map(|(_p, n)| n);
-            while let Some(cptr) = candidate {
-                // Safety: Link Valid Invariant means we can deref this
-                let cref = unsafe { cptr.as_ref() };
-
-                if cref.contents >= node.contents {
-                    break;
-                }
-                candidate = match cref.links.get() {
-                    Some((_, LinkPtr::Inner(next))) => Some(next),
-                    _ => None,
-                };
-            }
-
-            if let Some(neighbor) = candidate {
-                // We must insert just before neighbor.
-                // Safety: Link Valid Invariant means we can get a shared
-                // reference to neighbor's pointee.
-                let nref = unsafe { neighbor.as_ref() };
-                debug_assert!(nref.contents >= node.contents);
-                let (neigh_prev, neigh_next) = nref.links.get().unwrap();
-                node.links.set(Some((neigh_prev, LinkPtr::Inner(neighbor))));
-                nref.links.set(Some((LinkPtr::Inner(nnn), neigh_next)));
-                // Safety: Link Valid Invariant means we can get the shared
-                // reference to neigh_prev's pointee that we need to store this
-                // pointer.
-                unsafe {
-                    neigh_prev.change_next(LinkPtr::Inner(nnn));
-                }
-            } else {
-                // The node is becoming the new tail.
-                if let Some((old_tail, head)) = self.links.get() {
-                    node.links.set(Some((
-                        LinkPtr::Inner(old_tail),
-                        LinkPtr::End(NonNull::from(self.get_ref())),
-                    )));
-                    self.links.set(Some((nnn, head)));
-                    // Safety: Link Valid Invariant means we can get the shared
-                    // reference to old_tail's pointee that we need to store
-                    // this pointer.
-                    unsafe {
-                        LinkPtr::Inner(old_tail).change_next(LinkPtr::Inner(nnn));
-                    }
-                } else {
-                    // The node is, in fact, becoming the entire list.
-                    let lp = LinkPtr::End(NonNull::from(self.get_ref()));
-                    node.links.set(Some((lp, lp)));
-                    self.links.set(Some((nnn, nnn)));
-                }
-            }
-        }
 
         WaitForDetach {
             node,
-            polled_since_detach: Cell::new(false),
+            list: self,
+            state: Cell::new(WaitState::NotYetAttached),
             cleanup: Some(cleanup),
         }
     }
@@ -530,44 +472,130 @@ macro_rules! create_list {
 
 /// Internal future type used for `insert_and_wait`. Gotta express this as a
 /// named type because it needs a custom `Drop` impl.
-struct WaitForDetach<'a, T, F: FnOnce()> {
-    node: Pin<&'a Node<T>>,
-    polled_since_detach: Cell<bool>,
+struct WaitForDetach<'node, 'list, T, F: FnOnce()> {
+    node: Pin<&'node Node<T>>,
+    list: Pin<&'list WaitList<T>>,
+    state: Cell<WaitState>,
     cleanup: Option<F>,
 }
 
-impl<T, F: FnOnce()> Future for WaitForDetach<'_, T, F> {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum WaitState {
+    NotYetAttached,
+    Attached,
+    DetachedAndPolled,
+}
+
+impl<T, F: FnOnce()> Future for WaitForDetach<'_, '_, T, F>
+    where T: PartialOrd,
+{
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>)
         -> Poll<Self::Output>
     {
-        if self.node.is_detached() {
-            // The node is not attached to any list, but we're still borrowing
-            // it until we're dropped, so we don't need to replace the node
-            // field contents -- just set a flag to skip work in the Drop impl.
-            self.polled_since_detach.set(true);
-            Poll::Ready(())
-        } else {
-            // The node remains attached to the list. Capture the current task's
-            // waker.
-            self.node.waker.set(Some(cx.waker().clone()));
-            Poll::Pending
+        match self.state.get() {
+            WaitState::NotYetAttached => {
+                // Do the insertion part. This used to be a separate `insert` function,
+                // but that function had soundness risks and so I've inlined it.
+
+                let node = self.node;
+                let nnn = NonNull::from(&*node);
+                {
+                    // Node should not already belong to a list.
+                    assert!(node.is_detached());
+
+                    // Work through the nodes starting at the head, looking for the
+                    // future `next` of `node`.
+                    let mut candidate = self.list.links.get().map(|(_p, n)| n);
+                    while let Some(cptr) = candidate {
+                        // Safety: Link Valid Invariant means we can deref this
+                        let cref = unsafe { cptr.as_ref() };
+
+                        if cref.contents >= node.contents {
+                            break;
+                        }
+                        candidate = match cref.links.get() {
+                            Some((_, LinkPtr::Inner(next))) => Some(next),
+                            _ => None,
+                        };
+                    }
+
+                    if let Some(neighbor) = candidate {
+                        // We must insert just before neighbor.
+                        // Safety: Link Valid Invariant means we can get a shared
+                        // reference to neighbor's pointee.
+                        let nref = unsafe { neighbor.as_ref() };
+                        debug_assert!(nref.contents >= node.contents);
+                        let (neigh_prev, neigh_next) = nref.links.get().unwrap();
+                        node.links.set(Some((neigh_prev, LinkPtr::Inner(neighbor))));
+                        nref.links.set(Some((LinkPtr::Inner(nnn), neigh_next)));
+                        // Safety: Link Valid Invariant means we can get the shared
+                        // reference to neigh_prev's pointee that we need to store this
+                        // pointer.
+                        unsafe {
+                            neigh_prev.change_next(LinkPtr::Inner(nnn));
+                        }
+                    } else {
+                        // The node is becoming the new tail.
+                        if let Some((old_tail, head)) = self.list.links.get() {
+                            node.links.set(Some((
+                                LinkPtr::Inner(old_tail),
+                                LinkPtr::End(NonNull::from(self.list.get_ref())),
+                            )));
+                            self.list.links.set(Some((nnn, head)));
+                            // Safety: Link Valid Invariant means we can get the shared
+                            // reference to old_tail's pointee that we need to store
+                            // this pointer.
+                            unsafe {
+                                LinkPtr::Inner(old_tail).change_next(LinkPtr::Inner(nnn));
+                            }
+                        } else {
+                            // The node is, in fact, becoming the entire list.
+                            let lp = LinkPtr::End(NonNull::from(self.list.get_ref()));
+                            node.links.set(Some((lp, lp)));
+                            self.list.links.set(Some((nnn, nnn)));
+                        }
+                    }
+                }
+                self.state.set(WaitState::Attached);
+                self.node.waker.set(Some(cx.waker().clone()));
+                Poll::Pending
+            }
+            WaitState::Attached => {
+                // See if we've detached.
+                if self.node.is_detached() {
+                    // The node is not attached to any list, but we're still borrowing
+                    // it until we're dropped, so we don't need to replace the node
+                    // field contents -- just set a flag to skip work in the Drop impl.
+                    self.state.set(WaitState::DetachedAndPolled);
+                    Poll::Ready(())
+                } else {
+                    // The node remains attached to the list. While unlikely, it's
+                    // possible that the waker has changed. Update it.
+                    self.node.waker.set(Some(cx.waker().clone()));
+                    Poll::Pending
+                }
+            }
+            // This effectively "fuses" the future.
+            WaitState::DetachedAndPolled => Poll::Ready(()),
         }
     }
 }
 
-impl<T, F: FnOnce()> Drop for WaitForDetach<'_, T, F> {
+impl<T, F: FnOnce()> Drop for WaitForDetach<'_, '_, T, F> {
     fn drop(&mut self) {
-        if self.node.is_detached() {
-            if self.polled_since_detach.get() {
-                // No action necessary.
-            } else {
+        if self.state.get() == WaitState::Attached {
+            if self.node.is_detached() {
                 // Uh oh, we have not had a chance to handle the detach.
-                (self.cleanup.take().unwrap())();
+                if let Some(cleanup) = self.cleanup.take() {
+                    cleanup();
+                }
+            } else {
+                // If _we_ detach ourselves, we don't run the cleanup
+                // action.
+                self.node.detach();
             }
-        } else {
-            self.node.detach();
         }
     }
 }
@@ -998,6 +1026,23 @@ mod tests {
             "Future must run cleanup action when dropped \
              after detach without being polled");
         assert!(node.is_detached());
+    }
+
+    #[test]
+    fn test_insert_and_wait_not_eager() {
+        create_list!(list);
+
+        let mut node = pin!(Node::new(()));
+
+        // Insertion must not happen eagerly, it must wait for the insert future to
+        // be pinned and polled.
+        {
+            let _fut = list.insert_and_wait(node.as_mut());
+            // Should not be able to wake it!
+            assert_eq!(list.wake_oldest(), false);
+        }
+
+        assert_eq!(node.is_detached(), true);
     }
 
     #[test]
