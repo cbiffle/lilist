@@ -103,6 +103,7 @@
 
 use core::cell::{Cell, UnsafeCell};
 
+use core::fmt::Debug;
 use core::future::Future;
 use core::pin::Pin;
 use core::ptr::NonNull;
@@ -191,7 +192,7 @@ impl<T> Drop for Node<T> {
 
 /// We have to write a custom `Debug` impl for this type because `Waker` doesn't
 /// impl `Debug`.
-impl<T: core::fmt::Debug> core::fmt::Debug for Node<T> {
+impl<T: Debug> Debug for Node<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Node")
             .field("links", &self.links)
@@ -204,8 +205,8 @@ impl<T: core::fmt::Debug> core::fmt::Debug for Node<T> {
 ///////////////////////////////////////////////////////////////////////////
 // WaitList implementation
 
-/// Shorthand for `NonNull<Node<T>>`
-type Nnn<T> = NonNull<Node<T>>;
+/// Shorthand for `PinPtr<Node<T>>`
+type Npp<T> = PinPtr<Node<T>>;
 
 /// A list of waiters, waiting for something.
 ///
@@ -230,7 +231,7 @@ type Nnn<T> = NonNull<Node<T>>;
 /// the list, it should be impossible to drop the list while there's anything in
 /// it.
 pub struct WaitList<T> {
-    links: Cell<Option<(Nnn<T>, Nnn<T>)>>,
+    links: Cell<Option<(Npp<T>, Npp<T>)>>,
     _marker: (NotSendMarker, PhantomPinned),
 }
 
@@ -332,7 +333,7 @@ impl<T: PartialOrd> WaitList<T> {
         let mut candidate = self.links.get().map(|(_t, h)| h);
         while let Some(cptr) = candidate {
             // Safety: Link Valid Invariant
-            let cref = unsafe { Pin::new_unchecked(cptr.as_ref()) };
+            let cref = unsafe { cptr.get() };
             if cref.contents > threshold {
                 break;
             }
@@ -361,7 +362,7 @@ impl<T> WaitList<T> {
         let mut candidate = self.links.get().map(|(_t, h)| h);
         while let Some(cptr) = candidate {
             // Safety: Link Valid Invariant
-            let cref = unsafe { Pin::new_unchecked(cptr.as_ref()) };
+            let cref = unsafe { cptr.get() };
             // Copy the next pointer before detaching, since it's about to go
             // away.
             let next = cref.links.get().expect("node in list without links").1;
@@ -383,7 +384,7 @@ impl WaitList<()> {
     pub fn wake_oldest(self: Pin<&Self>) -> bool {
         if let Some((candidate, _front)) = self.links.get() {
             // Safety: Link Valid Invariant
-            let cref = unsafe { Pin::new_unchecked(candidate.as_ref()) };
+            let cref = unsafe { candidate.get() };
             if let Some(waker) = cref.detach() {
                 waker.wake();
             }
@@ -405,7 +406,7 @@ impl<T> Drop for WaitList<T> {
 /// We need a custom `Debug` impl because the inferred one will require `T:
 /// Debug`; since we only print pointers to `T` we don't need to be so
 /// stringent.
-impl<T: core::fmt::Debug> core::fmt::Debug for WaitList<T> {
+impl<T: Debug> Debug for WaitList<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("WaitList")
             .field("links", &self.links)
@@ -502,7 +503,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
                 // Do the insertion part. This used to be a separate `insert` function,
                 // but that function had soundness risks and so I've inlined it.
 
-                let nnn = NonNull::from(&*node);
+                let nnn = PinPtr::new(node);
                 {
                     // Node should not already belong to a list.
                     assert!(node.is_detached());
@@ -512,7 +513,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
                     let mut candidate = p.list.links.get().map(|(_p, n)| n);
                     while let Some(cptr) = candidate {
                         // Safety: Link Valid Invariant means we can deref this
-                        let cref = unsafe { cptr.as_ref() };
+                        let cref = unsafe { cptr.get() };
 
                         if cref.contents >= node.contents {
                             break;
@@ -527,7 +528,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
                         // We must insert just before neighbor.
                         // Safety: Link Valid Invariant means we can get a shared
                         // reference to neighbor's pointee.
-                        let nref = unsafe { neighbor.as_ref() };
+                        let nref = unsafe { neighbor.get() };
                         debug_assert!(nref.contents >= node.contents);
                         let (neigh_prev, neigh_next) = nref.links.get().unwrap();
                         node.links.set(Some((neigh_prev, LinkPtr::Inner(neighbor))));
@@ -543,7 +544,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
                         if let Some((old_tail, head)) = p.list.links.get() {
                             node.links.set(Some((
                                 LinkPtr::Inner(old_tail),
-                                LinkPtr::End(NonNull::from(p.list.get_ref())),
+                                LinkPtr::End(PinPtr::new(p.list.as_ref())),
                             )));
                             p.list.links.set(Some((nnn, head)));
                             // Safety: Link Valid Invariant means we can get the shared
@@ -554,7 +555,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
                             }
                         } else {
                             // The node is, in fact, becoming the entire list.
-                            let lp = LinkPtr::End(NonNull::from(p.list.get_ref()));
+                            let lp = LinkPtr::End(PinPtr::new(p.list.as_ref()));
                             node.links.set(Some((lp, lp)));
                             p.list.links.set(Some((nnn, nnn)));
                         }
@@ -624,6 +625,61 @@ impl<T, F: FnOnce()> PinnedDrop for WaitForDetach2<'_, T, F> {
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct NotSendMarker(PhantomData<*const ()>);
 
+/// A non-null pointer that points to something pinned.
+///
+/// This can only be created from a pinned reference, proving that, at the time
+/// it was created, the referend was pinned. To dereference it safely, the
+/// caller must ensure the referend is _still_ pinned, through whatever means.
+struct PinPtr<T>(NonNull<T>);
+
+impl<T> Copy for PinPtr<T> {}
+
+impl<T> Clone for PinPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Debug for PinPtr<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("PinPtr").field(&self.0.as_ptr()).finish()
+    }
+}
+
+impl<T> PartialEq for PinPtr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<T> Eq for PinPtr<T> {}
+
+impl<T> PinPtr<T> {
+    fn new(r: Pin<&T>) -> Self {
+        Self(NonNull::from(&*r))
+    }
+
+    /// Dereferences the pointer and pins the result.
+    ///
+    /// # Safety
+    ///
+    /// This is safe as long as you know that the referend is still alive and
+    /// pinned, through whatever context-specific means you have available.
+    unsafe fn get(&self) -> Pin<&T> {
+        // Safety: this dereferences our pointer, which is safe as long as the
+        // caller knows it's valid by some other means.
+        let r = unsafe {
+            self.0.as_ref()
+        };
+        // Safety: this claims the result is pinned, which is safe as long as
+        // the caller knows the referend is still pinned, through some other
+        // means.
+        unsafe {
+            Pin::new_unchecked(r)
+        }
+    }
+}
+
 /// A link pointer stored in a node.
 ///
 /// We implement a circular doubly-linked list, but unlike most such lists, we
@@ -634,15 +690,15 @@ struct NotSendMarker(PhantomData<*const ()>);
 /// but gives greater assurance against memory safety bugs.
 enum LinkPtr<T> {
     /// A pointer to a node within the list.
-    Inner(Nnn<T>),
+    Inner(Npp<T>),
     /// A pointer to the list root.
-    End(NonNull<WaitList<T>>),
+    End(PinPtr<WaitList<T>>),
 }
 
 impl<T> LinkPtr<T> {
     /// Extract the pointer as a node-pointer. If the pointer is to the list
     /// root, returns `None` instead.
-    fn as_node(&self) -> Option<Nnn<T>> {
+    fn as_node(&self) -> Option<Npp<T>> {
         if let Self::Inner(p) = self {
             Some(*p)
         } else {
@@ -706,16 +762,16 @@ impl<T> LinkPtr<T> {
         &self,
         neighbor: Self,
         rewrite1: impl FnOnce((Self, Self), Self) -> (Self, Self),
-        rewrite2: impl FnOnce((Nnn<T>, Nnn<T>), Nnn<T>) -> (Nnn<T>, Nnn<T>),
+        rewrite2: impl FnOnce((Npp<T>, Npp<T>), Npp<T>) -> (Npp<T>, Npp<T>),
     ) {
         match self {
             Self::Inner(node) => {
-                let node = unsafe { node.as_ref() };
+                let node = unsafe { node.get() };
                 let orig_links = node.links.get().unwrap();
                 node.links.set(Some(rewrite1(orig_links, neighbor)));
             }
             Self::End(listptr) => {
-                let list = unsafe { listptr.as_ref() };
+                let list = unsafe { listptr.get() };
                 match neighbor {
                     Self::End(other_list) => {
                         debug_assert!(*listptr == other_list);
@@ -755,7 +811,7 @@ impl<T> PartialEq for LinkPtr<T> {
 impl<T> Eq for LinkPtr<T> {}
 
 /// Implement `Debug` independent of `T` since we only print addresses.
-impl<T> core::fmt::Debug for LinkPtr<T> {
+impl<T> Debug for LinkPtr<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Inner(p) => f.debug_tuple("Inner").field(p).finish(),
@@ -806,7 +862,7 @@ mod tests {
 
     /// Performs a list structural integrity check, panics if any issues are
     /// found.
-    fn check<T: PartialOrd>(list: Pin<&WaitList<T>>) {
+    fn check<T: PartialOrd + Copy>(list: Pin<&WaitList<T>>) {
         let (tail, head) = if let Some((t, h)) = list.links.get() {
             (t, h)
         } else {
@@ -815,18 +871,18 @@ mod tests {
         };
 
         let mut cursor = head;
-        let mut expected_prev = LinkPtr::End(NonNull::from(&*list));
+        let mut expected_prev = LinkPtr::End(PinPtr::new(list));
         let mut prev_value = None;
         loop {
-            let node = unsafe { cursor.as_ref() };
+            let node = unsafe { cursor.get() };
             let (prev, next) = node.links.get().expect("detached node in list");
 
             assert_eq!(prev, expected_prev, "corrupt node prev pointer");
 
             if let Some(pv) = prev_value {
-                assert!(pv <= &node.contents, "ascending order not maintained");
+                assert!(pv <= node.contents, "ascending order not maintained");
             }
-            prev_value = Some(&node.contents);
+            prev_value = Some(node.contents);
 
             match next {
                 LinkPtr::Inner(next_node) => {
@@ -836,7 +892,7 @@ mod tests {
                 }
                 LinkPtr::End(end_list) => {
                     assert_eq!(cursor, tail, "unexpected end node");
-                    assert_eq!(end_list, NonNull::from(&*list),
+                    assert_eq!(end_list, PinPtr::new(list),
                         "cross-linked list");
                     break;
                 }
@@ -846,14 +902,14 @@ mod tests {
 
     #[allow(dead_code)] // useful when tests are failing
     fn dump<T>(list: Pin<&WaitList<T>>)
-        where T: core::fmt::Debug,
+        where T: Debug,
     {
         println!("--- list dump ---");
         let mut index = 0;
         let mut candidate = list.links.get().map(|(_t, h)| h);
         while let Some(cptr) = candidate {
             // Safety: Link Valid Invariant
-            let cref = unsafe { Pin::new_unchecked(cptr.as_ref()) };
+            let cref = unsafe { cptr.get() };
 
             println!("list index {index} @{cptr:?}: {cref:#?}");
             let next = cref.links.get().unwrap().1;
