@@ -13,7 +13,7 @@ use core::fmt::Write;
 use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll};
-use lilist::{create_list, noop_waker, Node};
+use lilist::{create_list, noop_waker};
 
 #[start]
 fn start(_: isize, _: *const *const u8) -> isize {
@@ -21,9 +21,8 @@ fn start(_: isize, _: *const *const u8) -> isize {
     writeln!(HostOut, "running wake test...").ok();
     {
         let w = noop_waker();
-        let node = pin!(Node::new(()));
 
-        let mut node1_wait = pin!(list.insert_and_wait(node));
+        let mut node1_wait = pin!(list.wait(()));
         let mut ctx = Context::from_waker(&w);
 
         // We can poll the insert future all we want but it doesn't resolve

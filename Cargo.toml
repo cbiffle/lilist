@@ -6,6 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+futures = { version = "0.3.30", default-features = false, features = ["async-await"] }
+pin-project = "1.1.5"
 
 [profile.dev]
 panic = "abort"

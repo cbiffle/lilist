@@ -6,14 +6,14 @@
 
 //! Doubly-linked intrusive lists for scheduling and waking.
 //!
-//! A [`WaitList<T>`][WaitList] keeps track of nodes (of type [`Node<T>`][Node])
-//! that each contain some value `T`. The list is kept in ascending sorted order
-//! by comparing the `T`s:
+//! A [`WaitList<T>`][WaitList] keeps track of nodes that each contain some
+//! value `T`. The list is kept in ascending sorted order by comparing the `T`s:
 //!
-//! - [`WaitList::insert_and_wait`] traverses the list to insert the `Node` in
-//!   its proper place, and then produces a future that waits for the node to be
+//! - [`WaitList::wait`] produces a future that, when polled, will traverse the
+//!   list and insert a node in the proper place, then wait for the node to be
 //!   kicked back out.
-//! - [`WaitList::wake_le`] starts at one end and removes every `Node` with a
+//!
+//! - [`WaitList::wake_le`] starts at one end and removes every node with a
 //!   value less than a threshold.
 //!
 //! The sort order is intended for keeping track of timestamps/deadlines, but
@@ -26,35 +26,30 @@
 //! # How to use for sleep/wake
 //!
 //! The basics are straightforward: given a `WaitList` tracking waiters on a
-//! particular event, create a `Node` and `insert_and_wait` it. At some future
-//! point in a concurrent process or interrupt handler, one of the `wake_*`
-//! methods on `WaitList` gets called, and the `Node` will be removed and its
-//! associated `Waker` invoked, causing the future produced by `insert_and_wait`
-//! to resolve.
+//! particular event, create a wait future by calling `wait` on it. At some
+//! future point in a concurrent process or interrupt handler, one of the
+//! `wake_*` methods on `WaitList` gets called, and the node will be removed and
+//! its associated `Waker` invoked, causing the future produced by `wait` to
+//! resolve.
 //!
 //! If you're using an async runtime, you probably don't need to think about
 //! `Waker`s specifically -- they're typically managed by the runtime.
 //!
 //! # Pinning
 //!
-//! Because `WaitList` and `Node` create circular, self-referential data
-//! structures, all operations require that they be
+//! Because `WaitList` creates circular, self-referential data structures, all
+//! operations require that they be
 //! [pinned](https://doc.rust-lang.org/core/pin/). Because we don't use the
 //! heap, we provide ways to create and use pinned data structures on the stack.
 //!
-//! Here is an example of creating a `Node` and joining an existing list, which
-//! is the most common use case in user code:
+//! Here is an example of creating a list and then waiting on it using async
+//! code:
 //!
 //! ```rust
-//! # use lilist::Node;
 //! # async fn foo() {
-//! # lilist::create_list!(wait_list);
-//! let mut my_node = core::pin::pin!(Node::new(()));
+//! lilist::create_list!(wait_list);
 //!
-//! // Join a wait list
-//! wait_list.insert_and_wait(my_node.as_mut()).await;
-//!
-//! // All done, my_node can be dropped
+//! wait_list.wait(()).await;
 //! # }
 //! ```
 //!
@@ -64,12 +59,18 @@
 //! it's very, very hard to get them right. I believe this implementation to be
 //! sound because it relies on *blocking*.
 //!
-//! Because `insert_and_wait` takes control away from the caller until the node
-//! is kicked back out of the list, it is borrowing the `&mut Node` for the
-//! duration of its membership in the list. If the API were instead `insert`,
-//! we'd return to the caller, who is still holding a `&mut Node` -- a
-//! supposedly exclusive reference to a structure that is now also reachable
-//! through the `WaitList`!
+//! - The list node is opaquely contained in the future returned by `wait`.
+//!
+//! - Calling `wait` only returns a future that captures a pinned reference to
+//! the list (which borrows it, preventing it from going anywhere). 
+//!
+//! - To actually insert itself into the list, the future requires that it be
+//! polled, which requires in turn that it be pinned, assuring us that _it_ is
+//! also not going anywhere.
+//!
+//! - Due to the contract required by `Pin`, we also can be confident that the
+//! future (and thus the node) won't be overwritten or deallocated without being
+//! dropped, and its `Drop` impl will unwire it from the list.
 //!
 //! This is why there is no `insert` operation, or a `take` operation that
 //! returns a node -- both operations would compromise memory safety.
@@ -84,10 +85,7 @@
 // of pinned structures, and ensuring that the `Drop` impl of those pinned
 // structures will remove their addresses from any link.
 
-// We can be no_std in the general case, but if you build with unwinding on,
-// we'll catch panics in certain cases to ensure that invariants hold. This
-// requires std.
-#![cfg_attr(not(panic = "unwind"), no_std)]
+#![cfg_attr(not(test), no_std)]
 
 #![warn(
     elided_lifetimes_in_paths,
@@ -111,6 +109,8 @@ use core::ptr::NonNull;
 use core::task::{Poll, RawWaker, RawWakerVTable, Waker};
 use core::marker::{PhantomData, PhantomPinned};
 
+use pin_project::{pin_project, pinned_drop};
+
 /// Marker trait implementing the "Captures Trick" from Rust RFC 3498, ensuring
 /// that we do lifetime capturing right in the 2021 edition.
 ///
@@ -126,7 +126,7 @@ impl<U: ?Sized, T> Captures<T> for U {}
 
 /// A node that can be inserted into a [`WaitList`] and used to wait for an
 /// event.
-pub struct Node<T> {
+struct Node<T> {
     /// Links to the previous and next things in a list, in that order.
     ///
     /// If this node is not a member of a list (is "detached"), this will be
@@ -142,7 +142,7 @@ pub struct Node<T> {
 
 impl<T> Node<T> {
     /// Creates a new `Node` containing `contents` as its value.
-    pub fn new(contents: T) -> Self {
+    fn new(contents: T) -> Self {
         Self {
             links: Cell::default(),
             waker: Cell::new(None),
@@ -154,7 +154,7 @@ impl<T> Node<T> {
     /// Disconnects a node from any list. This is idempotent.
     ///
     /// This does _not_ poke the waker.
-    pub fn detach(self: Pin<&Self>) -> Option<Waker> {
+    fn detach(self: Pin<&Self>) -> Option<Waker> {
         // TODO: it's not clear that this operation needs to require Pin. It's
         // safe if called on a non-pinned node, since by definition if a node is
         // not pinned it isn't in a list.
@@ -174,7 +174,7 @@ impl<T> Node<T> {
     }
 
     /// Checks if a node is detached.
-    pub fn is_detached(&self) -> bool {
+    fn is_detached(&self) -> bool {
         self.links.get().is_none()
     }
 }
@@ -263,98 +263,50 @@ impl<T> WaitList<T> {
 
 /// Operations on lists of ordered nodes (which includes `()`).
 impl<T: PartialOrd> WaitList<T> {
-    /// Inserts `node` into this list, maintaining ascending sort order, and
-    /// then waits for it to be kicked back out.
+    /// Produces a future that, when polled, will insert a node into this list
+    /// just after any other nodes that are `<= contents`.
     ///
-    /// Specifically, `node` will be placed just *before* the first item in the
-    /// list whose `contents` are greater than or equal to `node.contents`, if
-    /// such an item exists, or at the end if not. This means if you use it on a
-    /// `WaitList<()>` (that is, a simple queue) it will insert the node at the
-    /// front of the list.
-    ///
-    /// The returned future will resolve only when `node` has become detached
-    /// from the list.
+    /// (For the simplest case where `T` is `()`, this means the node will be
+    /// inserted at the end of the list.)
     ///
     /// # Cancellation
     ///
-    /// Dropping the future returned by `insert_and_wait` will forceably detach
-    /// `node` from `self`. This is important for safety: the future borrows
-    /// `node`, preventing concurrent modification while there are outstanding
-    /// pointers in the list. If the future did not detach on drop, the caller
-    /// would regain access to their `&mut Node` while the list also has
-    /// pointers, introducing aliasing of the node.
+    /// Dropping this future immediately does effectively nothing.
     ///
-    /// If the future is dropped without ever being polled, and the node has
-    /// been detached already, then it's possible to lose the event that caused
-    /// it to become detached. If such race conditions are a concern, use
-    /// `insert_and_wait_with_cleanup` instead.
-    ///
-    /// # Panics
-    ///
-    /// If `node` is not detached (if it's in another list) when this is called.
-    /// This indicates a bug in the list implementation, and not your code.
-    pub fn insert_and_wait<'list, 'node>(
+    /// Dropping this future after poll, but before it resolves, removes the
+    /// node from the list.
+    pub fn wait<'list>(
         self: Pin<&'list Self>,
-        node: Pin<&'node mut Node<T>>,
-    ) -> impl Future<Output = ()> + Captures<(&'list Self, &'node mut Node<T>)> {
-        self.insert_and_wait_with_cleanup(
-            node,
-            || (),
-        )
+        contents: T,
+    ) -> impl Future<Output = ()> + Captures<&'list Self> {
+        self.wait_with_cleanup(contents, || ())
     }
 
-    /// Inserts `node` into this list, maintaining ascending sort order, and
-    /// then waits for it to be kicked back out.
+    /// Produces a future that, when polled, will insert a node into this list
+    /// just after any other nodes that are `<= contents`.
     ///
-    /// Specifically, `node` will be placed just *before* the first item in the
-    /// list whose `contents` are greater than or equal to `node.contents`, if
-    /// such an item exists, or at the end if not. This means if you use it on a
-    /// `WaitList<()>` (that is, a simple queue) it will insert the node at the
-    /// front of the list.
+    /// (For the simplest case where `T` is `()`, this means the node will be
+    /// inserted at the end of the list.)
     ///
-    /// The returned future will resolve only when `node` has become detached
-    /// from the list.
-    ///
-    /// The `cleanup` action is performed in when...
-    ///
-    /// 1. `node` has been detached by some other code,
-    /// 2. The returned `Future` has not yet been polled, and
-    /// 3. It is being dropped.
-    ///
-    /// This gives you an opportunity to record the event as having happened and
-    /// avoid potentially lost events due to race conditions.
+    /// This version has a "cleanup action" that will be run if the node is
+    /// detached from the list, and then dropped before this future is polled to
+    /// observe it. This can be useful for cleaning up certain kinds of
+    /// synchronization structures.
     ///
     /// # Cancellation
     ///
-    /// Dropping the future returned by `insert_and_wait_with_cleanup` will
-    /// forceably detach `node` from `self`. This is important for safety: the
-    /// future borrows `node`, preventing concurrent modification while there
-    /// are outstanding pointers in the list. If the future did not detach on
-    /// drop, the caller would regain access to their `&mut Node` while the list
-    /// also has pointers, introducing aliasing of the node.
+    /// Dropping this future immediately does effectively nothing.
     ///
-    /// If the future is dropped without ever being polled, and the node has
-    /// been detached already, the `Drop` impl will call `cleanup`. If you find
-    /// yourself passing a no-op closure for `cleanup`, see `insert_and_wait`,
-    /// which does this for you (but in a central place that may reduce code
-    /// size).
-    ///
-    /// # Panics
-    ///
-    /// If `node` is not detached (if it's in another list) when this is called.
-    /// This indicates a bug in the list implementation, and not your code.
-    pub fn insert_and_wait_with_cleanup<'list, 'node, F: FnOnce()>(
+    /// Dropping this future after poll, but before it resolves, removes the
+    /// node from the list. If the node was _already_ removed from the list by
+    /// some other code waking it, the `cleanup` function will be called.
+    pub fn wait_with_cleanup<'list, F: FnOnce()>(
         self: Pin<&'list Self>,
-        node: Pin<&'node mut Node<T>>,
+        contents: T,
         cleanup: F,
-    ) -> impl Future<Output = ()> + Captures<(&'list Self, &'node mut Node<T>)> {
-        // We required `node` to be `mut` to prove exclusive ownership, but we
-        // don't actually need to mutate it -- and we're going to alias it. So,
-        // downgrade.
-        let node = node.into_ref();
-
-        WaitForDetach {
-            node,
+    ) -> impl Future<Output = ()> + Captures<&'list Self> {
+        WaitForDetach2 {
+            node: Node::new(contents),
             list: self,
             state: Cell::new(WaitState::NotYetAttached),
             cleanup: Some(cleanup),
@@ -388,6 +340,11 @@ impl<T: PartialOrd> WaitList<T> {
 
             candidate = next.as_node();
         }
+    }
+
+    /// Checks whether this list has no waiters on it.
+    pub fn is_empty(&self) -> bool {
+        self.links.get().is_none()
     }
 }
 
@@ -468,12 +425,14 @@ macro_rules! create_list {
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// WaitForDetach future implementation.
+// WaitForDetach2 future implementation.
 
 /// Internal future type used for `insert_and_wait`. Gotta express this as a
 /// named type because it needs a custom `Drop` impl.
-struct WaitForDetach<'node, 'list, T, F: FnOnce()> {
-    node: Pin<&'node Node<T>>,
+#[pin_project(PinnedDrop)]
+struct WaitForDetach2<'list, T, F: FnOnce()> {
+    #[pin]
+    node: Node<T>,
     list: Pin<&'list WaitList<T>>,
     state: Cell<WaitState>,
     cleanup: Option<F>,
@@ -486,7 +445,7 @@ enum WaitState {
     DetachedAndPolled,
 }
 
-impl<T, F: FnOnce()> Future for WaitForDetach<'_, '_, T, F>
+impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
     where T: PartialOrd,
 {
     type Output = ();
@@ -494,12 +453,13 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, '_, T, F>
     fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>)
         -> Poll<Self::Output>
     {
-        match self.state.get() {
+        let p = self.project();
+        match p.state.get() {
             WaitState::NotYetAttached => {
                 // Do the insertion part. This used to be a separate `insert` function,
                 // but that function had soundness risks and so I've inlined it.
 
-                let node = self.node;
+                let node = p.node.as_ref();
                 let nnn = NonNull::from(&*node);
                 {
                     // Node should not already belong to a list.
@@ -507,7 +467,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, '_, T, F>
 
                     // Work through the nodes starting at the head, looking for the
                     // future `next` of `node`.
-                    let mut candidate = self.list.links.get().map(|(_p, n)| n);
+                    let mut candidate = p.list.links.get().map(|(_p, n)| n);
                     while let Some(cptr) = candidate {
                         // Safety: Link Valid Invariant means we can deref this
                         let cref = unsafe { cptr.as_ref() };
@@ -538,12 +498,12 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, '_, T, F>
                         }
                     } else {
                         // The node is becoming the new tail.
-                        if let Some((old_tail, head)) = self.list.links.get() {
+                        if let Some((old_tail, head)) = p.list.links.get() {
                             node.links.set(Some((
                                 LinkPtr::Inner(old_tail),
-                                LinkPtr::End(NonNull::from(self.list.get_ref())),
+                                LinkPtr::End(NonNull::from(p.list.get_ref())),
                             )));
-                            self.list.links.set(Some((nnn, head)));
+                            p.list.links.set(Some((nnn, head)));
                             // Safety: Link Valid Invariant means we can get the shared
                             // reference to old_tail's pointee that we need to store
                             // this pointer.
@@ -552,28 +512,28 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, '_, T, F>
                             }
                         } else {
                             // The node is, in fact, becoming the entire list.
-                            let lp = LinkPtr::End(NonNull::from(self.list.get_ref()));
+                            let lp = LinkPtr::End(NonNull::from(p.list.get_ref()));
                             node.links.set(Some((lp, lp)));
-                            self.list.links.set(Some((nnn, nnn)));
+                            p.list.links.set(Some((nnn, nnn)));
                         }
                     }
                 }
-                self.state.set(WaitState::Attached);
-                self.node.waker.set(Some(cx.waker().clone()));
+                p.state.set(WaitState::Attached);
+                p.node.waker.set(Some(cx.waker().clone()));
                 Poll::Pending
             }
             WaitState::Attached => {
                 // See if we've detached.
-                if self.node.is_detached() {
+                if p.node.is_detached() {
                     // The node is not attached to any list, but we're still borrowing
                     // it until we're dropped, so we don't need to replace the node
                     // field contents -- just set a flag to skip work in the Drop impl.
-                    self.state.set(WaitState::DetachedAndPolled);
+                    p.state.set(WaitState::DetachedAndPolled);
                     Poll::Ready(())
                 } else {
                     // The node remains attached to the list. While unlikely, it's
                     // possible that the waker has changed. Update it.
-                    self.node.waker.set(Some(cx.waker().clone()));
+                    p.node.waker.set(Some(cx.waker().clone()));
                     Poll::Pending
                 }
             }
@@ -583,18 +543,20 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, '_, T, F>
     }
 }
 
-impl<T, F: FnOnce()> Drop for WaitForDetach<'_, '_, T, F> {
-    fn drop(&mut self) {
-        if self.state.get() == WaitState::Attached {
-            if self.node.is_detached() {
+#[pinned_drop]
+impl<T, F: FnOnce()> PinnedDrop for WaitForDetach2<'_, T, F> {
+    fn drop(self: Pin<&mut Self>) {
+        let p = self.project();
+        if p.state.get() == WaitState::Attached {
+            if p.node.is_detached() {
                 // Uh oh, we have not had a chance to handle the detach.
-                if let Some(cleanup) = self.cleanup.take() {
+                if let Some(cleanup) = p.cleanup.take() {
                     cleanup();
                 }
             } else {
                 // If _we_ detach ourselves, we don't run the cleanup
                 // action.
-                self.node.detach();
+                p.node.as_ref().detach();
             }
         }
     }
@@ -784,6 +746,12 @@ mod tests {
     use core::task::Context;
     use std::sync::Arc;
 
+    fn poll<T>(fut: Pin<&mut impl Future<Output = T>>) -> Poll<T> {
+        let waker = noop_waker();
+        let mut ctx = Context::from_waker(&waker);
+        fut.poll(&mut ctx)
+    }
+
     /// Performs a list structural integrity check, panics if any issues are
     /// found.
     fn check<T: PartialOrd>(list: Pin<&WaitList<T>>) {
@@ -912,44 +880,36 @@ mod tests {
     fn insert_and_cancel_future() {
         create_list!(list, ());
 
-        let mut node = pin!(Node::new(()));
+        {
+            let mut fut = pin!(list.wait(()));
+            assert!(list.is_empty(), "wait should not eagerly attach");
+            assert!(poll(fut.as_mut()).is_pending());
+            assert!(!list.is_empty(), "wait should attach on first poll");
+            check(list.as_ref());
+        }
+        assert!(list.is_empty(), "wait should detach on cancel");
 
-        let fut = list.insert_and_wait(node.as_mut());
         check(list.as_ref());
-        drop(fut);
-
-        assert!(node.is_detached());
-    }
-
-    #[test]
-    fn reuse_node_after_cancellation() {
-        create_list!(list, ());
-        let mut node = pin!(Node::new(()));
-
-        let fut = list.insert_and_wait(node.as_mut());
-        drop(fut);
-        assert!(node.is_detached());
-
-        let fut = list.insert_and_wait(node.as_mut());
-        drop(fut);
-        assert!(node.is_detached());
     }
 
     #[test]
     fn insert_two_and_cancel_out_of_order() {
         create_list!(list, ());
-        let mut node1 = pin!(Node::new(()));
 
-        let node1_fut = list.insert_and_wait(node1.as_mut());
+        {
+            let mut fut2 = pin!(list.wait(()));
+            {
+                let mut fut1 = pin!(list.wait(()));
 
-        let mut node2 = pin!(Node::new(()));
-        let node2_fut = list.insert_and_wait(node2.as_mut());
+                assert!(poll(fut1.as_mut()).is_pending());
+                assert!(poll(fut2.as_mut()).is_pending());
 
-        drop(node1_fut);
-        assert!(node1.is_detached());
-
-        drop(node2_fut);
-        assert!(node2.is_detached());
+                // fut1 dropped here:
+            }
+            // fut2 dropped here:
+        }
+        assert!(list.is_empty());
+        check(list.as_ref());
     }
 
     #[test]
@@ -957,15 +917,14 @@ mod tests {
         create_list!(list, ());
         {
             let (w, wake_count) = spy_waker();
-            let node = pin!(Node::new(()));
 
-            let mut node1_wait = pin!(list.insert_and_wait(node));
+            let mut wait1 = pin!(list.wait(()));
             let mut ctx = Context::from_waker(&w);
 
             // We can poll the insert future all we want but it doesn't resolve
             // while the node is in the list.
-            assert_eq!(node1_wait.as_mut().poll(&mut ctx), Poll::Pending);
-            assert_eq!(node1_wait.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(wait1.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(wait1.as_mut().poll(&mut ctx), Poll::Pending);
 
             assert_eq!(wake_count.load(Ordering::Relaxed), 0);
 
@@ -975,7 +934,7 @@ mod tests {
             assert_eq!(wake_count.load(Ordering::Relaxed), 1);
 
             // Now the future should resolve.
-            assert_eq!(node1_wait.as_mut().poll(&mut ctx), Poll::Ready(()));
+            assert_eq!(wait1.as_mut().poll(&mut ctx), Poll::Ready(()));
         }
     }
 
@@ -983,21 +942,18 @@ mod tests {
     fn insert_and_cancel_with_cleanup_action() {
         create_list!(list, ());
 
-        let mut node = pin!(Node::new(()));
-
         // Flag we'll update from our cleanup action to detect that it's been
         // run.
         let future_dropped = AtomicBool::new(false);
 
         {
             // Insert with cleanup closure.
-            let fut = pin!(list.insert_and_wait_with_cleanup(
-                node.as_mut(),
+            let fut = pin!(list.wait_with_cleanup(
+                (),
                 || future_dropped.store(true, Ordering::Relaxed),
             ));
 
-            // Future is currently in the "node attached, never polled"
-            // state.
+            // Future is currently in the "not yet attached" state.
 
             assert_eq!(future_dropped.load(Ordering::Relaxed), false,
                 "Future must not run cleanup action until dropped");
@@ -1017,32 +973,27 @@ mod tests {
 
             assert!(list.wake_oldest());
             assert_eq!(wake_count.load(Ordering::Relaxed), 1);
-            // Note: we can't assert detached here because the future still
-            // owns the node
 
             // Drop the future without polling it.
         }
         assert_eq!(future_dropped.load(Ordering::Relaxed), true,
             "Future must run cleanup action when dropped \
              after detach without being polled");
-        assert!(node.is_detached());
     }
 
     #[test]
     fn test_insert_and_wait_not_eager() {
         create_list!(list);
 
-        let mut node = pin!(Node::new(()));
-
         // Insertion must not happen eagerly, it must wait for the insert future to
         // be pinned and polled.
         {
-            let _fut = list.insert_and_wait(node.as_mut());
+            let _fut = pin!(list.wait(()));
             // Should not be able to wake it!
             assert_eq!(list.wake_oldest(), false);
+            assert!(list.is_empty());
         }
-
-        assert_eq!(node.is_detached(), true);
+        assert!(list.is_empty());
     }
 
     #[test]
@@ -1052,16 +1003,18 @@ mod tests {
             // Create a collection of four nodes with varying values. We expect
             // the list to maintain these in ascending order, regardless of the
             // order in which we insert them.
-            let mut node1 = pin!(Node::new(1u32));
-            let mut node2 = pin!(Node::new(2u32));
-            let mut node3 = pin!(Node::new(3u32));
-            let mut node4 = pin!(Node::new(4u32));
+            let mut node1_fut = pin!(list.wait(1u32));
+            let mut node2_fut = pin!(list.wait(2u32));
+            let mut node3_fut = pin!(list.wait(3u32));
+            let mut node4_fut = pin!(list.wait(4u32));
+
+            assert!(list.is_empty());
 
             // Insert them in shuffled order.
-            let mut node2_fut = pin!(list.insert_and_wait(node2.as_mut()));
-            let mut node4_fut = pin!(list.insert_and_wait(node4.as_mut()));
-            let mut node3_fut = pin!(list.insert_and_wait(node3.as_mut()));
-            let mut node1_fut = pin!(list.insert_and_wait(node1.as_mut()));
+            assert!(poll(node2_fut.as_mut()).is_pending());
+            assert!(poll(node4_fut.as_mut()).is_pending());
+            assert!(poll(node3_fut.as_mut()).is_pending());
+            assert!(poll(node1_fut.as_mut()).is_pending());
 
             // Set up minimal async runtime state to poll them.
             let (w, wake_count) = spy_waker();
@@ -1114,16 +1067,16 @@ mod tests {
         create_list!(list);
         {
             // Make four nodes.
-            let mut node1 = pin!(Node::new(()));
-            let mut node2 = pin!(Node::new(()));
-            let mut node3 = pin!(Node::new(()));
-            let mut node4 = pin!(Node::new(()));
+            let mut node1 = pin!(list.wait(()));
+            let mut node2 = pin!(list.wait(()));
+            let mut node3 = pin!(list.wait(()));
+            let mut node4 = pin!(list.wait(()));
 
-            // Insert them in order, so node1 is oldest.
-            let mut node1_fut = pin!(list.insert_and_wait(node1.as_mut()));
-            let mut node2_fut = pin!(list.insert_and_wait(node2.as_mut()));
-            let mut node3_fut = pin!(list.insert_and_wait(node3.as_mut()));
-            let mut node4_fut = pin!(list.insert_and_wait(node4.as_mut()));
+            // Poll to insert them in order, so node1 is oldest.
+            assert!(poll(node1.as_mut()).is_pending());
+            assert!(poll(node2.as_mut()).is_pending());
+            assert!(poll(node3.as_mut()).is_pending());
+            assert!(poll(node4.as_mut()).is_pending());
 
             // Set up minimal async runtime state to poll them.
             let (w, wake_count) = spy_waker();
@@ -1131,37 +1084,37 @@ mod tests {
 
             // Verify our starting position:
             check(list.as_ref());
-            assert_eq!(node1_fut.as_mut().poll(&mut ctx), Poll::Pending);
-            assert_eq!(node2_fut.as_mut().poll(&mut ctx), Poll::Pending);
-            assert_eq!(node3_fut.as_mut().poll(&mut ctx), Poll::Pending);
-            assert_eq!(node4_fut.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node1.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node2.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node3.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node4.as_mut().poll(&mut ctx), Poll::Pending);
             assert_eq!(wake_count.load(Ordering::Relaxed), 0);
 
             // Start waking individual nodes.
             assert!(list.wake_oldest());
             check(list.as_ref());
-            assert_eq!(node1_fut.as_mut().poll(&mut ctx), Poll::Ready(()));
-            assert_eq!(node2_fut.as_mut().poll(&mut ctx), Poll::Pending);
-            assert_eq!(node3_fut.as_mut().poll(&mut ctx), Poll::Pending);
-            assert_eq!(node4_fut.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node1.as_mut().poll(&mut ctx), Poll::Ready(()));
+            assert_eq!(node2.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node3.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node4.as_mut().poll(&mut ctx), Poll::Pending);
             assert_eq!(wake_count.load(Ordering::Relaxed), 1);
 
             assert!(list.wake_oldest());
             check(list.as_ref());
-            assert_eq!(node2_fut.as_mut().poll(&mut ctx), Poll::Ready(()));
-            assert_eq!(node3_fut.as_mut().poll(&mut ctx), Poll::Pending);
-            assert_eq!(node4_fut.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node2.as_mut().poll(&mut ctx), Poll::Ready(()));
+            assert_eq!(node3.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node4.as_mut().poll(&mut ctx), Poll::Pending);
             assert_eq!(wake_count.load(Ordering::Relaxed), 2);
 
             assert!(list.wake_oldest());
             check(list.as_ref());
-            assert_eq!(node3_fut.as_mut().poll(&mut ctx), Poll::Ready(()));
-            assert_eq!(node4_fut.as_mut().poll(&mut ctx), Poll::Pending);
+            assert_eq!(node3.as_mut().poll(&mut ctx), Poll::Ready(()));
+            assert_eq!(node4.as_mut().poll(&mut ctx), Poll::Pending);
             assert_eq!(wake_count.load(Ordering::Relaxed), 3);
 
             assert!(list.wake_oldest());
             check(list.as_ref());
-            assert_eq!(node4_fut.as_mut().poll(&mut ctx), Poll::Ready(()));
+            assert_eq!(node4.as_mut().poll(&mut ctx), Poll::Ready(()));
             assert_eq!(wake_count.load(Ordering::Relaxed), 4);
         }
     }
