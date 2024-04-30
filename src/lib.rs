@@ -329,12 +329,22 @@ impl<T: PartialOrd> WaitList<T> {
     ///
     /// - All `Node`s remaining in this list have `contents > threshold`.
     pub fn wake_le(self: Pin<&Self>, threshold: T) {
+        self.wake_while(|t| t <= &threshold)
+    }
+
+    /// Work through the list from the head, waking the longest prefix of nodes
+    /// that all pass `pred`. That is, applies `pred` to the contents of each
+    /// node, waking the node and continuing if it returns `true`, and leaving
+    /// the node and stopping if it returns `false`.
+    ///
+    /// Returns `true` if at least one node was woken up.
+    pub fn wake_while(self: Pin<&Self>, mut pred: impl FnMut(&T) -> bool) {
         // Work through nodes from the head (least) moving up.
         let mut candidate = self.links.get().map(|(_t, h)| h);
         while let Some(cptr) = candidate {
             // Safety: Link Valid Invariant
             let cref = unsafe { cptr.get() };
-            if cref.contents > threshold {
+            if !pred(&cref.contents) {
                 break;
             }
             // Copy the next pointer before detaching, since it's about to go
@@ -355,6 +365,23 @@ impl<T: PartialOrd> WaitList<T> {
 }
 
 impl<T> WaitList<T> {
+    /// Wakes the head of the list, but only if it exists and satisfies `pred`.
+    ///
+    /// Returns `true` if a node was woken up, `false` otherwise.
+    pub fn wake_one_if(self: Pin<&Self>, pred: impl FnOnce(&T) -> bool) -> bool {
+        if let Some((_back, candidate)) = self.links.get() {
+            // Safety: Link Valid Invariant
+            let cref = unsafe { candidate.get() };
+            if pred(&cref.contents) {
+                if let Some(waker) = cref.detach() {
+                    waker.wake();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Convenience method for waking all the waiters, because not all ordered
     /// types have an easily available MAX element, and because (on
     /// insertion-ordered queues) `wake_le(())` looks weird.
@@ -382,16 +409,7 @@ impl WaitList<()> {
     /// Returns a flag indicating whether anything was done (i.e. whether the
     /// list was non-empty).
     pub fn wake_oldest(self: Pin<&Self>) -> bool {
-        if let Some((candidate, _front)) = self.links.get() {
-            // Safety: Link Valid Invariant
-            let cref = unsafe { candidate.get() };
-            if let Some(waker) = cref.detach() {
-                waker.wake();
-            }
-            true
-        } else {
-            false
-        }
+        self.wake_one_if(|_| true)
     }
 }
 
@@ -508,50 +526,50 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, T, F>
                     // Node should not already belong to a list.
                     assert!(node.is_detached());
 
-                    // Work through the nodes starting at the head, looking for the
-                    // future `next` of `node`.
-                    let mut candidate = p.list.links.get().map(|(_p, n)| n);
+                    // Work through the nodes starting at the tail, looking for the
+                    // future `prev` of `node`.
+                    let mut candidate = p.list.links.get().map(|(tail, _)| tail);
                     while let Some(cptr) = candidate {
                         // Safety: Link Valid Invariant means we can deref this
                         let cref = unsafe { cptr.get() };
 
-                        if cref.contents >= node.contents {
+                        if cref.contents <= node.contents {
                             break;
                         }
                         candidate = match cref.links.get() {
-                            Some((_, LinkPtr::Inner(next))) => Some(next),
+                            Some((LinkPtr::Inner(prev), _)) => Some(prev),
                             _ => None,
                         };
                     }
 
                     if let Some(neighbor) = candidate {
-                        // We must insert just before neighbor.
+                        // We must insert just after neighbor.
                         // Safety: Link Valid Invariant means we can get a shared
                         // reference to neighbor's pointee.
                         let nref = unsafe { neighbor.get() };
-                        debug_assert!(nref.contents >= node.contents);
+                        debug_assert!(nref.contents <= node.contents);
                         let (neigh_prev, neigh_next) = nref.links.get().unwrap();
-                        node.links.set(Some((neigh_prev, LinkPtr::Inner(neighbor))));
-                        nref.links.set(Some((LinkPtr::Inner(nnn), neigh_next)));
+                        node.links.set(Some((LinkPtr::Inner(neighbor), neigh_next)));
+                        nref.links.set(Some((neigh_prev, LinkPtr::Inner(nnn))));
                         // Safety: Link Valid Invariant means we can get the shared
-                        // reference to neigh_prev's pointee that we need to store this
+                        // reference to neigh_next's pointee that we need to store this
                         // pointer.
                         unsafe {
-                            neigh_prev.change_next(LinkPtr::Inner(nnn));
+                            neigh_next.change_prev(LinkPtr::Inner(nnn));
                         }
                     } else {
-                        // The node is becoming the new tail.
-                        if let Some((old_tail, head)) = p.list.links.get() {
+                        // The node is becoming the new head.
+                        if let Some((tail, old_head)) = p.list.links.get() {
                             node.links.set(Some((
-                                LinkPtr::Inner(old_tail),
                                 LinkPtr::End(PinPtr::new(p.list.as_ref())),
+                                LinkPtr::Inner(old_head),
                             )));
-                            p.list.links.set(Some((nnn, head)));
+                            p.list.links.set(Some((tail, nnn)));
                             // Safety: Link Valid Invariant means we can get the shared
                             // reference to old_tail's pointee that we need to store
                             // this pointer.
                             unsafe {
-                                LinkPtr::Inner(old_tail).change_next(LinkPtr::Inner(nnn));
+                                LinkPtr::Inner(old_head).change_prev(LinkPtr::Inner(nnn));
                             }
                         } else {
                             // The node is, in fact, becoming the entire list.
