@@ -315,7 +315,7 @@ impl<T: PartialOrd> WaitList<T> {
             node: UnsafeCell::new(Node::new(contents)),
             list: self,
             state: Cell::new(WaitState::NotYetAttached),
-            cleanup: Some(cleanup),
+            cleanup: Cell::new(Some(cleanup)),
         }
     }
 
@@ -469,7 +469,7 @@ struct WaitForDetach<'list, T, F: FnOnce()> {
     state: Cell<WaitState>,
     /// Cleanup action; this is always set to `Some`, but we `take` it to run it
     /// for simplicity, so this becomes `None` during drop, sometimes.
-    cleanup: Option<F>,
+    cleanup: Cell<Option<F>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -487,7 +487,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, T, F>
     fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>)
         -> Poll<Self::Output>
     {
-        let p = self.project();
+        let p = self.as_ref().project_ref();
         // Ensure that we can only produce a Pin<&> to the node.
         //
         // Safety: this is unsafe for two reasons. First, we are dereferencing a
@@ -497,7 +497,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, T, F>
         // Second, we are pinning the result. We are basically implementing our
         // own pin projection through the UnsafeCell, converting a `Pin<&mut
         // UnsafeCell<T>>` to a `Pin<&T>`. 
-        let node = unsafe { Pin::new_unchecked(&*p.node.as_ref().get()) };
+        let node = unsafe { Pin::new_unchecked(&*p.node.get()) };
         match p.state.get() {
             WaitState::NotYetAttached => {
                 // Do the insertion part. This used to be a separate `insert` function,
@@ -589,7 +589,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach<'_, T, F>
 #[pinned_drop]
 impl<T, F: FnOnce()> PinnedDrop for WaitForDetach<'_, T, F> {
     fn drop(self: Pin<&mut Self>) {
-        let p = self.project();
+        let p = self.as_ref().project_ref();
         // Ensure that we can only produce a Pin<&> to the node.
         //
         // Safety: this is unsafe for two reasons. First, we are dereferencing a
@@ -599,7 +599,7 @@ impl<T, F: FnOnce()> PinnedDrop for WaitForDetach<'_, T, F> {
         // Second, we are pinning the result. We are basically implementing our
         // own pin projection through the UnsafeCell, converting a `Pin<&mut
         // UnsafeCell<T>>` to a `Pin<&T>`. 
-        let node = unsafe { Pin::new_unchecked(&*p.node.as_ref().get()) };
+        let node = unsafe { Pin::new_unchecked(&*p.node.get()) };
         if p.state.get() == WaitState::Attached {
             if node.is_detached() {
                 // Uh oh, we have not had a chance to handle the detach.
