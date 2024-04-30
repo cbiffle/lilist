@@ -311,7 +311,7 @@ impl<T: PartialOrd> WaitList<T> {
         contents: T,
         cleanup: F,
     ) -> impl Future<Output = ()> + Captures<&'list Self> {
-        WaitForDetach2 {
+        WaitForDetach {
             node: UnsafeCell::new(Node::new(contents)),
             list: self,
             state: Cell::new(WaitState::NotYetAttached),
@@ -431,11 +431,11 @@ macro_rules! create_list {
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// WaitForDetach2 future implementation.
+// WaitForDetach future implementation.
 
 /// Internal future type used for `wait`.
 #[pin_project(PinnedDrop)]
-struct WaitForDetach2<'list, T, F: FnOnce()> {
+struct WaitForDetach<'list, T, F: FnOnce()> {
     /// The Node we use to join the list, once we decide to do that. There are a
     /// couple odd things going on here that are worth pointing out.
     ///
@@ -479,7 +479,7 @@ enum WaitState {
     DetachedAndPolled,
 }
 
-impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
+impl<T, F: FnOnce()> Future for WaitForDetach<'_, T, F>
     where T: PartialOrd,
 {
     type Output = ();
@@ -587,7 +587,7 @@ impl<T, F: FnOnce()> Future for WaitForDetach2<'_, T, F>
 }
 
 #[pinned_drop]
-impl<T, F: FnOnce()> PinnedDrop for WaitForDetach2<'_, T, F> {
+impl<T, F: FnOnce()> PinnedDrop for WaitForDetach<'_, T, F> {
     fn drop(self: Pin<&mut Self>) {
         let p = self.project();
         // Ensure that we can only produce a Pin<&> to the node.
