@@ -980,11 +980,6 @@ mod tests {
     }
 
     #[test]
-    fn create_and_drop_node() {
-        let _node = pin!(Node::new(()));
-    }
-
-    #[test]
     fn insert_and_cancel_future() {
         create_list!(list, ());
 
@@ -1011,9 +1006,11 @@ mod tests {
 
                 assert!(poll(fut1.as_mut()).is_pending());
                 assert!(poll(fut2.as_mut()).is_pending());
+                check(list.as_ref());
 
                 // fut1 dropped here:
             }
+            check(list.as_ref());
             // fut2 dropped here:
         }
         assert!(list.is_empty());
