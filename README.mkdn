@@ -1,3 +1,15 @@
+# This has been folded into `lilos`
+
+This work has been folded into `lilos` and this repository is no longer being
+updated.
+
+Docs: https://docs.rs/lilos-list/latest/lilos_list/
+Code: https://github.com/cbiffle/lilos/tree/main/list
+
+Previous readme follows.
+
+---------------------------
+
 # Intrusive stack-allocated doubly-linked list example
 
 ## Quickstart
